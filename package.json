@@ -15,7 +15,7 @@
     "capture:parity": "node scripts/capture-parity-fixture.mjs",
     "check:ts": "pnpm --filter @theahaco/soroban-sim-web-demo check",
     "test:browser": "pnpm --filter @theahaco/soroban-sim-web-demo test",
-    "m0": "pnpm run build:fixture-contracts && pnpm run test:native && pnpm run build:component && pnpm run build:jco && pnpm run test:wasmtime && pnpm run check:ts && pnpm run test:browser"
+    "m0": "pnpm run test:native && pnpm run build:component && pnpm run build:jco && pnpm run test:wasmtime && pnpm run check:ts && pnpm run test:browser"
   },
   "devDependencies": {
     "@bytecodealliance/jco": "^1.30.0"
