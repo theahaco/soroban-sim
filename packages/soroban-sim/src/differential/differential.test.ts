@@ -1,23 +1,33 @@
 /**
  * M3 RPC-equivalence differential test.
  *
- * Drives soroban-sim over a committed parity fixture captured from a live
- * Stellar testnet RPC `simulateTransaction`, then compares the two outputs
- * field-by-field (see `./compare.ts`). The MUST-match fields (invocation result
- * ScVal, footprint read-only/read-write sets, auth, contract events) are
- * asserted equal; resource/fee divergence is tolerated as `divergent-expected`.
+ * Drives soroban-sim over committed parity fixtures captured from a live Stellar
+ * testnet RPC `simulateTransaction`, then compares the two outputs field-by-field
+ * (see `./compare.ts`). Two fixtures are exercised:
+ *   - `native-sac-decimals`  — read-only SAC `decimals()` (result + footprint RO)
+ *   - `native-sac-transfer`  — SAC `transfer()` exercising the WRITE + AUTH +
+ *     contract-event surface (footprint RW, auth entry, transfer event)
+ *
+ * Each fixture is simulated with `applyRpcAdjustments = true`
+ * (`AdjustmentSource::RpcDefault`) so the decoded `SorobanTransactionData`
+ * resources/fee carry the same adjustment stellar-rpc's preflight applies.
+ *
+ * MUST-match fields (asserted `match`): invocation result ScVal, footprint
+ * read-only/read-write sets, auth entries, contract events. No field may be an
+ * outright `MISMATCH`. Resource/fee residuals are classified `divergent-explained`
+ * (documented, non-zero) — never silently force-passed.
  *
  * ── Protocol version note (a real finding, not papered over) ────────────────
- * The fixture was captured against Stellar testnet at ledger protocol 27, but
+ * The fixtures were captured against Stellar testnet at ledger protocol 27, but
  * `soroban-sim-core` links `soroban-env-host` 28.0.2, whose network interface
  * protocol is 28. The host's replay-safety guard (`check_ledger_protocol_supported`,
  * invoked from `Host::set_ledger_info` during recording setup) rejects *any*
- * ledger protocol != 28 with a bare `Error(Context, InternalError)` — no
- * diagnostics, thrown before the contract body runs. Feeding the fixture's
- * protocol 27 therefore fails with that internal error. Since the SAC `decimals()`
- * call is protocol-invariant, the harness pins the ledger context to the host's
- * supported protocol (28) when driving the local simulation; RESULT and FOOTPRINT
- * parity are unaffected. This is documented as HOST_PROTOCOL_VERSION below.
+ * ledger protocol != 28 with a bare `Error(Context, InternalError)`. The harness
+ * therefore pins the ledger context to the host's supported protocol (28) when
+ * driving the local simulation; this is `HOST_PROTOCOL_VERSION` below. RESULT,
+ * FOOTPRINT, AUTH and EVENT parity are unaffected, but the raw CPU *instruction
+ * metering* differs between protocol 27 and 28 — which is exactly the residual
+ * delta the `instructions (RpcDefault)` field documents.
  */
 import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -68,7 +78,7 @@ import { decodeSsim } from "./decode-ssim.js";
 
 /**
  * Ledger protocol version the linked `soroban-env-host` (28.0.2) will run. See
- * the file header for why the fixture's captured protocol (27) is overridden.
+ * the file header for why the fixtures' captured protocol (27) is overridden.
  */
 const HOST_PROTOCOL_VERSION = 28;
 
@@ -106,97 +116,129 @@ function hexToBytes(hex: string): Uint8Array {
   return out;
 }
 
-function loadFixture(): ParityFixture {
+function loadFixture(name: string): ParityFixture {
   const path = fileURLToPath(
-    new URL(
-      "../../../../fixtures/parity/native-sac-decimals.json",
-      import.meta.url,
-    ),
+    new URL(`../../../../fixtures/parity/${name}.json`, import.meta.url),
   );
   return JSON.parse(readFileSync(path, "utf8")) as ParityFixture;
 }
 
-describe("RPC equivalence: native SAC decimals()", () => {
-  const fixture = loadFixture();
+/** Fixtures exercised by the parity suite, and the fields each is expected to cover. */
+const FIXTURES = [
+  { name: "native-sac-decimals", expectRw: false, expectAuth: false },
+  { name: "native-sac-transfer", expectRw: true, expectAuth: true },
+] as const;
+
+describe("RPC equivalence (RpcDefault adjustments)", () => {
   let simulator: SorobanSimulator;
 
   beforeAll(async () => {
     simulator = await SorobanSimulator.create({
-      networkPassphrase: fixture.networkPassphrase,
-      // No provider: the fixture snapshot is complete, so the simulation
-      // resolves to `complete` in a single round with no state fetches.
+      // networkPassphrase is per-fixture but identical across our testnet
+      // captures; set from the first fixture. No provider: each fixture snapshot
+      // is complete, so the simulation resolves in a single round.
+      networkPassphrase: loadFixture(FIXTURES[0].name).networkPassphrase,
     });
   });
 
-  it("matches the recorded RPC simulateTransaction on the MUST-match fields", async () => {
-    const ctx = fixture.ledgerContext;
-    const ledgerContext: LedgerContext = {
-      protocolVersion: HOST_PROTOCOL_VERSION, // see file header: 27 -> 28
-      sequenceNumber: ctx.sequenceNumber,
-      timestamp: BigInt(ctx.timestamp),
-      networkId: hexToBytes(ctx.networkId),
-      baseReserve: ctx.baseReserve,
-      minTempEntryTtl: ctx.minTempEntryTtl,
-      minPersistentEntryTtl: ctx.minPersistentEntryTtl,
-      maxEntryTtl: ctx.maxEntryTtl,
-    };
+  for (const spec of FIXTURES) {
+    it(`matches recorded RPC simulateTransaction: ${spec.name}`, async () => {
+      const fixture = loadFixture(spec.name);
+      const ctx = fixture.ledgerContext;
+      const ledgerContext: LedgerContext = {
+        protocolVersion: HOST_PROTOCOL_VERSION, // see file header: 27 -> 28
+        sequenceNumber: ctx.sequenceNumber,
+        timestamp: BigInt(ctx.timestamp),
+        networkId: hexToBytes(ctx.networkId),
+        baseReserve: ctx.baseReserve,
+        minTempEntryTtl: ctx.minTempEntryTtl,
+        minPersistentEntryTtl: ctx.minPersistentEntryTtl,
+        maxEntryTtl: ctx.maxEntryTtl,
+      };
 
-    const seedEntries: LedgerEntry[] = fixture.snapshot.map((e) => ({
-      entryXdr: b64ToBytes(e.entryXdr),
-      liveUntilLedger: e.liveUntilLedger ?? undefined,
-    }));
+      const seedEntries: LedgerEntry[] = fixture.snapshot.map((e) => ({
+        entryXdr: b64ToBytes(e.entryXdr),
+        liveUntilLedger: e.liveUntilLedger ?? undefined,
+      }));
 
-    const result = await simulator.simulateTransaction({
-      transactionXdr: b64ToBytes(fixture.txXdr),
-      ledgerContext,
-      seedEntries,
-      // The component requires a 32-byte PRNG seed.
-      basePrngSeed: new Uint8Array(32),
-      enableDiagnostics: true,
-    });
+      const result = await simulator.simulateTransaction({
+        transactionXdr: b64ToBytes(fixture.txXdr),
+        ledgerContext,
+        seedEntries,
+        // The component requires a 32-byte PRNG seed.
+        basePrngSeed: new Uint8Array(32),
+        enableDiagnostics: true,
+        // Reproduce stellar-rpc preflight's resource/fee adjustment so the
+        // decoded transaction_data resources/fee are comparable to the fixture.
+        applyRpcAdjustments: true,
+      });
 
-    // Full snapshot seeded => resolves without any needs-state round trips.
-    expect(result.rounds).toBe(1);
-    expect(result.requestedKeyCount).toBe(0);
+      // Full snapshot seeded => resolves without any needs-state round trips.
+      expect(result.rounds).toBe(1);
+      expect(result.requestedKeyCount).toBe(0);
 
-    const decoded = decodeSsim(result.resultXdr);
+      const decoded = decodeSsim(result.resultXdr);
 
-    // The local run must actually succeed (not an inline host/contract error).
-    // A failure here is a real finding (e.g. the protocol-version guard) — fail
-    // loudly with the host error rather than papering over it.
-    if (!decoded.result.ok) {
-      throw new Error(
-        `local simulation returned an inline error instead of a value: ${decoded.result.error}`,
+      // The local run must actually succeed (not an inline host/contract error).
+      // A failure here is a real finding (e.g. the protocol-version guard) — fail
+      // loudly with the host error rather than papering over it.
+      if (!decoded.result.ok) {
+        throw new Error(
+          `local simulation returned an inline error instead of a value: ${decoded.result.error}`,
+        );
+      }
+      expect(decoded.result.ok).toBe(true);
+
+      const report = buildParityReport(decoded, fixture.rpc);
+
+      // eslint-disable-next-line no-console
+      console.log(
+        `\nParity report — ${fixture.case} (${fixture.functionName}):\n` +
+          `local ledger protocol pinned to ${HOST_PROTOCOL_VERSION} ` +
+          `(fixture captured at ${ctx.protocolVersion}), RpcDefault adjustments\n\n` +
+          formatParityTable(report) +
+          "\n",
       );
-    }
-    expect(decoded.result.ok).toBe(true);
 
-    const report = buildParityReport(decoded, fixture.rpc);
+      const verdictOf = (field: string) =>
+        report.fields.find((f) => f.field === field)?.verdict;
 
-    // eslint-disable-next-line no-console
-    console.log(
-      `\nParity report — ${fixture.case} (${fixture.functionName}):\n` +
-        `local ledger protocol pinned to ${HOST_PROTOCOL_VERSION} ` +
-        `(fixture captured at ${ctx.protocolVersion})\n\n` +
-        formatParityTable(report) +
-        "\n",
-    );
+      // MUST-match fields (all fixtures).
+      expect(verdictOf("result (ScVal)")).toBe("match");
+      expect(verdictOf("footprint readOnly")).toBe("match");
+      expect(verdictOf("footprint readWrite")).toBe("match");
+      expect(verdictOf("auth entries")).toBe("match");
+      expect(verdictOf("contract events")).toBe("match");
 
-    const verdictOf = (field: string) =>
-      report.fields.find((f) => f.field === field)?.verdict;
+      // Read/write bytes match under RpcDefault (no byte-count adjustment).
+      expect(verdictOf("read bytes")).toBe("match");
+      expect(verdictOf("write bytes")).toBe("match");
 
-    // MUST-match fields.
-    expect(verdictOf("result (ScVal)")).toBe("match");
-    expect(verdictOf("footprint readOnly")).toBe("match");
-    expect(verdictOf("footprint readWrite")).toBe("match");
+      // Fixture-specific coverage assertions: the transfer case must actually
+      // exercise the write footprint + auth surface (guards against a fixture
+      // regressing to a read-only shape).
+      const rwField = report.fields.find((f) => f.field === "footprint readWrite");
+      const authField = report.fields.find((f) => f.field === "auth entries");
+      const eventsField = report.fields.find((f) => f.field === "contract events");
+      if (spec.expectRw) {
+        expect(rwField?.rpc).toBe("2 key(s)");
+        expect(rwField?.local).toBe("2 key(s)");
+      }
+      if (spec.expectAuth) {
+        expect(authField?.local).toBe("1");
+        expect(authField?.rpc).toBe("1");
+        expect(eventsField?.local).toBe("1");
+        expect(eventsField?.rpc).toBe("1");
+      }
 
-    // No field may be an outright MISMATCH; divergent-expected is tolerated.
-    const mismatches = report.fields.filter((f) => f.verdict === "MISMATCH");
-    expect(
-      mismatches,
-      `unexpected MISMATCH field(s): ${mismatches
-        .map((f) => `${f.field} (local=${f.local}, rpc=${f.rpc})`)
-        .join("; ")}`,
-    ).toEqual([]);
-  });
+      // No field may be an outright MISMATCH; divergent-explained is tolerated.
+      const mismatches = report.fields.filter((f) => f.verdict === "MISMATCH");
+      expect(
+        mismatches,
+        `unexpected MISMATCH field(s): ${mismatches
+          .map((f) => `${f.field} (local=${f.local}, rpc=${f.rpc})`)
+          .join("; ")}`,
+      ).toEqual([]);
+    });
+  }
 });

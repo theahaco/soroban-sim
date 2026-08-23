@@ -65,6 +65,32 @@ pub struct SimulationRequest {
     pub unmapped_policy: UnmappedPolicy,
     pub base_prng_seed: [u8; 32],
     pub enable_diagnostics: bool,
+    pub adjustment: AdjustmentSource,
+}
+
+/// Selects the resource/fee adjustment model applied to the simulation result.
+///
+/// soroban-simulation post-processes the raw metered resources through a
+/// [`SimulationAdjustmentConfig`] before reporting `simulated_instructions` and
+/// the resource fee. `None` reports the raw metered values (no scaling/padding);
+/// `RpcDefault` applies the same adjustment defaults stellar-rpc's preflight
+/// uses, so the reported instructions/fees reproduce what RPC returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdjustmentSource {
+    /// `SimulationAdjustmentConfig::no_adjustments()` — raw metered resources.
+    None,
+    /// `SimulationAdjustmentConfig::default_adjustment()` — RPC-parity
+    /// adjustments (instructions ×1.04 + 50_000, matching stellar-rpc preflight).
+    RpcDefault,
+}
+
+impl AdjustmentSource {
+    fn config(self) -> SimulationAdjustmentConfig {
+        match self {
+            AdjustmentSource::None => SimulationAdjustmentConfig::no_adjustments(),
+            AdjustmentSource::RpcDefault => SimulationAdjustmentConfig::default_adjustment(),
+        }
+    }
 }
 
 /// Outcome of a single simulation pass.
@@ -126,7 +152,7 @@ pub fn simulate(request: SimulationRequest) -> Result<SimOutcome> {
     let result = simulate_invoke_host_function_op(
         snapshot,
         &network_config,
-        &SimulationAdjustmentConfig::no_adjustments(),
+        &request.adjustment.config(),
         &request.ledger_info,
         request.host_function,
         RecordingInvocationAuthMode::recording(true, true),
@@ -212,6 +238,7 @@ pub fn simulate_transaction(
     unmapped_policy: UnmappedPolicy,
     base_prng_seed: [u8; 32],
     enable_diagnostics: bool,
+    adjustment: AdjustmentSource,
 ) -> Result<SimOutcome> {
     let (host_function, source_account) = extract_invoke_host_function(&tx_envelope)?;
     simulate(SimulationRequest {
@@ -224,6 +251,7 @@ pub fn simulate_transaction(
         unmapped_policy,
         base_prng_seed,
         enable_diagnostics,
+        adjustment,
     })
 }
 
@@ -249,6 +277,8 @@ pub fn fixture_request() -> Result<SimulationRequest> {
         unmapped_policy: UnmappedPolicy::Absent,
         base_prng_seed: FIXTURE_PRNG_SEED,
         enable_diagnostics: true,
+        // Raw metered resources keep the 388-byte golden byte-identical.
+        adjustment: AdjustmentSource::None,
     })
 }
 
@@ -545,6 +575,7 @@ pub fn integration_request(
         unmapped_policy,
         base_prng_seed: FIXTURE_PRNG_SEED,
         enable_diagnostics: true,
+        adjustment: AdjustmentSource::None,
     }
 }
 
@@ -716,6 +747,7 @@ mod tests {
             UnmappedPolicy::Absent,
             FIXTURE_PRNG_SEED,
             true,
+            AdjustmentSource::None,
         )
         .unwrap();
 
@@ -756,6 +788,82 @@ mod tests {
             signatures: VecM::default(),
         });
         assert!(extract_invoke_host_function(&env).is_err());
+    }
+
+    /// `simulated_instructions` is the first u32 (big-endian) after the
+    /// `SSIM0\0` magic in the encoded output.
+    fn simulated_instructions(output: &[u8]) -> u32 {
+        let offset = b"SSIM0\0".len();
+        u32::from_be_bytes(output[offset..offset + 4].try_into().unwrap())
+    }
+
+    /// Walk the SSIM layout past magic/instr/mem/invoke_result and the three
+    /// XDR vecs (auth/contract_events/diagnostic_events) to the optional
+    /// `transaction_data` field, and decode it.
+    fn transaction_data(
+        output: &[u8],
+    ) -> soroban_env_host::xdr::SorobanTransactionData {
+        let read_u32 = |o: usize| u32::from_be_bytes(output[o..o + 4].try_into().unwrap()) as usize;
+        let mut o = b"SSIM0\0".len() + 4 + 4; // magic + simulated_instructions + simulated_memory
+        o += 1; // invoke_result tag
+        o += 4 + read_u32(o); // invoke_result bytes
+        for _ in 0..3 {
+            let count = read_u32(o);
+            o += 4;
+            for _ in 0..count {
+                o += 4 + read_u32(o);
+            }
+        }
+        assert_eq!(output[o], 1, "fixture run should carry transaction_data");
+        o += 1;
+        let len = read_u32(o);
+        o += 4;
+        soroban_env_host::xdr::SorobanTransactionData::from_xdr(
+            &output[o..o + len],
+            Limits::none(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn adjustment_source_changes_reported_resources() {
+        let complete = |adjustment| {
+            let mut request = fixture_request().unwrap();
+            request.adjustment = adjustment;
+            match simulate(request).unwrap() {
+                SimOutcome::Complete(bytes) => bytes,
+                SimOutcome::NeedsState(_) => panic!("fixture needs state"),
+            }
+        };
+
+        let none = complete(AdjustmentSource::None);
+        let rpc = complete(AdjustmentSource::RpcDefault);
+
+        // NOTE: in soroban-simulation 28.0.2, `simulated_instructions` is the raw
+        // metered CPU count and is NOT touched by the adjustment config; the
+        // adjustment scales the resources/fee reported in `transaction_data`
+        // (SorobanResources.instructions ×1.04 + 50_000, resource_fee ×1.15).
+        // Both runs therefore report the same simulated_instructions...
+        assert_eq!(simulated_instructions(&none), 2086263);
+        assert_eq!(simulated_instructions(&rpc), 2086263);
+
+        // ...but the transaction_data resources/fees differ, which is the knob.
+        let none_td = transaction_data(&none);
+        let rpc_td = transaction_data(&rpc);
+
+        // Observed on the add-i32 fixture:
+        //   None      -> resources.instructions = 2086263, resource_fee = 2388
+        //   RpcDefault-> resources.instructions = 2169713, resource_fee = 2539
+        assert_eq!(none_td.resources.instructions, 2086263, "None raw instructions drifted");
+        assert_eq!(rpc_td.resources.instructions, 2169713, "RpcDefault adjusted instructions drifted");
+        assert_eq!(none_td.resource_fee, 2388, "None raw resource_fee drifted");
+        assert_eq!(rpc_td.resource_fee, 2539, "RpcDefault adjusted resource_fee drifted");
+        assert_ne!(none_td.resources.instructions, rpc_td.resources.instructions);
+        assert_ne!(none, rpc, "adjustment knob must change the encoded output");
+
+        // None still reproduces the golden byte-for-byte.
+        let golden = run_fixture().unwrap();
+        assert_eq!(none, golden);
     }
 
     fn first_result_xdr(output: &[u8]) -> Result<Vec<u8>> {

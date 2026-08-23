@@ -213,6 +213,7 @@ fn add_i32_request(
         unmapped_policy,
         base_prng_seed: FIXTURE_PRNG_SEED,
         enable_diagnostics: true,
+        adjustment: soroban_sim_core::AdjustmentSource::None,
     }
 }
 

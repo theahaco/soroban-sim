@@ -9,11 +9,21 @@ use soroban_env_host::xdr::{
 };
 use soroban_env_host::LedgerInfo;
 use soroban_sim_core::{
-    simulate, simulate_transaction, LedgerEntryWithLiveUntil, NetworkConfigSource, SimOutcome,
-    SimulationRequest, UnmappedPolicy,
+    simulate, simulate_transaction, AdjustmentSource, LedgerEntryWithLiveUntil,
+    NetworkConfigSource, SimOutcome, SimulationRequest, UnmappedPolicy,
 };
 
 struct Component;
+
+/// Map the WIT `apply-rpc-adjustments` bool onto the core adjustment selector:
+/// false (back-compat default) => raw metered values; true => RPC-parity.
+fn adjustment_from_wit(apply_rpc_adjustments: bool) -> AdjustmentSource {
+    if apply_rpc_adjustments {
+        AdjustmentSource::RpcDefault
+    } else {
+        AdjustmentSource::None
+    }
+}
 
 impl Guest for Component {
     fn run_fixture() -> Result<Vec<u8>, String> {
@@ -56,6 +66,7 @@ fn simulate_transaction_request(request: TransactionRequest) -> anyhow::Result<O
         UnmappedPolicy::Unknown,
         base_prng_seed,
         request.enable_diagnostics,
+        adjustment_from_wit(request.apply_rpc_adjustments),
     )?;
     outcome_to_wit(outcome)
 }
@@ -103,6 +114,7 @@ fn simulate_request(request: Request) -> anyhow::Result<Outcome> {
         unmapped_policy: UnmappedPolicy::Unknown,
         base_prng_seed,
         enable_diagnostics: request.enable_diagnostics,
+        adjustment: adjustment_from_wit(request.apply_rpc_adjustments),
     })?;
     outcome_to_wit(outcome)
 }

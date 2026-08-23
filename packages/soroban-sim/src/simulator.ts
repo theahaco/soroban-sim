@@ -76,6 +76,12 @@ export interface SimulateInput {
   seedEntries?: LedgerEntry[];
   basePrngSeed?: Uint8Array;
   enableDiagnostics?: boolean;
+  /**
+   * Apply soroban-simulation's RPC-parity resource/fee adjustment. Defaults to
+   * false (raw metered resources/fees); set true to reproduce the padded
+   * instructions/fees stellar-rpc's preflight returns.
+   */
+  applyRpcAdjustments?: boolean;
 }
 
 export interface SimulateTransactionInput {
@@ -86,6 +92,12 @@ export interface SimulateTransactionInput {
   seedEntries?: LedgerEntry[];
   basePrngSeed?: Uint8Array;
   enableDiagnostics?: boolean;
+  /**
+   * Apply soroban-simulation's RPC-parity resource/fee adjustment. Defaults to
+   * false (raw metered resources/fees); set true to reproduce the padded
+   * instructions/fees stellar-rpc's preflight returns.
+   */
+  applyRpcAdjustments?: boolean;
 }
 
 export interface SimulateResult {
@@ -226,6 +238,7 @@ export class SorobanSimulator {
           knownAbsentKeys,
           basePrngSeed: input.basePrngSeed ?? EMPTY,
           enableDiagnostics: input.enableDiagnostics ?? false,
+          applyRpcAdjustments: input.applyRpcAdjustments ?? false,
         }),
       runOpts,
     );
@@ -256,6 +269,7 @@ export class SorobanSimulator {
           knownAbsentKeys,
           basePrngSeed: input.basePrngSeed ?? EMPTY,
           enableDiagnostics: input.enableDiagnostics ?? false,
+          applyRpcAdjustments: input.applyRpcAdjustments ?? false,
         };
         return runTx(request);
       },

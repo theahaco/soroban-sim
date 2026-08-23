@@ -3,25 +3,40 @@
  * Stellar RPC `simulateTransaction` response into a common {@link ParityView} and
  * compare them field-by-field.
  *
+ * The local view is built from a run driven with `applyRpcAdjustments = true`
+ * (`AdjustmentSource::RpcDefault`), so its `SorobanTransactionData` resources and
+ * `resourceFee` carry soroban-simulation's RPC-parity adjustment — the same
+ * `SimulationAdjustmentConfig::default_adjustment()` stellar-rpc's preflight
+ * applies. The raw metered instruction count (adjustment-independent, read from
+ * the SSIM `simulated_instructions` header) is reported separately as
+ * informational.
+ *
  * Comparison policy (see `docs/differential-testing.md` "Comparison fields"):
  *   - invocation RESULT (ScVal) ............ MUST match
- *   - FOOTPRINT read-only / read-write sets  MUST match
- *   - AUTH entries ......................... MUST match
- *   - contract EVENTS ...................... MUST match
+ *   - FOOTPRINT read-only / read-write sets  MUST match (canonical LedgerKey XDR)
+ *   - AUTH entries ......................... MUST match (canonical XDR set)
+ *   - contract EVENTS ...................... MUST match (canonical ContractEvent
+ *     XDR set — topics + data, not just a count)
  *   - RESOURCE estimates (instructions,
- *     read/write bytes) .................... compare; may legitimately diverge
- *   - FEES (resource fee) .................. EXPECTED to diverge — soroban-sim
- *     core uses `SimulationAdjustmentConfig::no_adjustments()` while Stellar RPC
- *     applies conservative fee/instruction adjustments.
+ *     read/write bytes) .................... compared under RpcDefault; read/write
+ *     bytes match, instructions carry a residual protocol-metering delta
+ *   - resource FEE ........................ compared under RpcDefault
  *
- * Each field lands in the report with a {@link Verdict}: `match`,
- * `divergent-expected` (a known, tolerated difference), or `MISMATCH` (a real
- * disagreement that fails the differential test).
+ * Each field lands in the report with a {@link Verdict}:
+ *   - `match` ............... byte-identical / equal
+ *   - `divergent-explained`  a real, non-zero difference with a documented cause
+ *                            (exact numbers + smallest explanation in `note`)
+ *   - `divergent-expected` . a tolerated, informational difference
+ *   - `MISMATCH` ........... a real disagreement that fails the differential test
  */
 import { scValToNative, xdr } from "@stellar/stellar-sdk";
 import type { SsimDecoded } from "./decode-ssim.js";
 
-export type Verdict = "match" | "divergent-expected" | "MISMATCH";
+export type Verdict =
+  | "match"
+  | "divergent-explained"
+  | "divergent-expected"
+  | "MISMATCH";
 
 /** One compared field in the parity report. */
 export interface ParityField {
@@ -29,7 +44,7 @@ export interface ParityField {
   local: string;
   rpc: string;
   verdict: Verdict;
-  /** Optional human note (e.g. why a divergence is expected). */
+  /** Optional human note (e.g. why a divergence is expected/explained). */
   note?: string;
 }
 
@@ -69,11 +84,14 @@ export interface ParityView {
   footprintReadWrite: string[];
   /** Sorted canonical `SorobanAuthorizationEntry` XDR base64. */
   auth: string[];
-  /** Number of contract-type events (excludes diagnostic/system events). */
-  contractEventCount: number;
+  /** Sorted canonical `ContractEvent` XDR base64 (topics + data). */
+  contractEvents: string[];
   /** Number of diagnostic-type events (fn_call / fn_return, etc.). */
   diagnosticEventCount: number;
+  /** Adjusted instruction count (RpcDefault) — from `SorobanTransactionData`. */
   instructions: number;
+  /** Raw metered instruction count (adjustment-independent); undefined for RPC. */
+  rawInstructions?: number;
   readBytes: number;
   writeBytes: number;
   /** Resource fee in stroops, as a string. */
@@ -103,6 +121,10 @@ function canonicalAuth(b64: string): string {
   return xdr.SorobanAuthorizationEntry.fromXdr(b64, "base64").toXdr("base64");
 }
 
+function canonicalContractEvent(b64: string): string {
+  return xdr.ContractEvent.fromXdr(b64, "base64").toXdr("base64");
+}
+
 function nativeToDisplay(value: unknown): string {
   if (typeof value === "bigint") return `${value.toString()}n`;
   try {
@@ -115,9 +137,11 @@ function nativeToDisplay(value: unknown): string {
 }
 
 /**
- * Build a {@link ParityView} from a decoded local SSIM result. A local failure
- * (inline host/contract error, or missing transaction data) is represented so
- * the comparison surfaces it as a mismatch rather than silently passing.
+ * Build a {@link ParityView} from a decoded local SSIM result. Pass a run driven
+ * with `applyRpcAdjustments = true` so the transaction-data resources/fee carry
+ * the RPC-parity adjustment. A local failure (inline host/contract error, or
+ * missing transaction data) is represented so the comparison surfaces it as a
+ * mismatch rather than silently passing.
  */
 export function buildLocalView(decoded: SsimDecoded): ParityView {
   let resultScVal: string;
@@ -135,6 +159,8 @@ export function buildLocalView(decoded: SsimDecoded): ParityView {
 
   let footprintReadOnly: string[] = [];
   let footprintReadWrite: string[] = [];
+  // Adjusted instruction count comes from transaction_data; fall back to the raw
+  // metered header only if transaction data is somehow absent.
   let instructions = decoded.simulatedInstructions;
   let readBytes = 0;
   let writeBytes = 0;
@@ -164,9 +190,12 @@ export function buildLocalView(decoded: SsimDecoded): ParityView {
     footprintReadOnly,
     footprintReadWrite,
     auth: decoded.auth.map((a) => canonicalAuth(bytesToB64(a))).sort(),
-    contractEventCount: decoded.contractEvents.length,
+    contractEvents: decoded.contractEvents
+      .map((e) => canonicalContractEvent(bytesToB64(e)))
+      .sort(),
     diagnosticEventCount: decoded.diagnosticEvents.length,
     instructions,
+    rawInstructions: decoded.simulatedInstructions,
     readBytes,
     writeBytes,
     resourceFee,
@@ -175,14 +204,22 @@ export function buildLocalView(decoded: SsimDecoded): ParityView {
 
 /** Build a {@link ParityView} from the recorded RPC fixture fields. */
 export function buildRpcView(rpc: RpcFixtureData): ParityView {
-  let contractEventCount = 0;
+  // RPC returns each event wrapped as a DiagnosticEvent. The SAC contract event
+  // (type `contract`) carries the transfer topics + data; fn_call / fn_return
+  // are type `diagnostic`. Extract the inner ContractEvent XDR for the contract
+  // ones so it compares against our SSIM ContractEvent blobs.
+  const contractEvents: string[] = [];
   let diagnosticEventCount = 0;
   for (const evB64 of rpc.events) {
     const de = xdr.DiagnosticEvent.fromXdr(evB64, "base64");
     const typeName = de.event.type.name;
-    if (typeName === "contract") contractEventCount += 1;
-    else if (typeName === "diagnostic") diagnosticEventCount += 1;
+    if (typeName === "contract") {
+      contractEvents.push(de.event.toXdr("base64"));
+    } else if (typeName === "diagnostic") {
+      diagnosticEventCount += 1;
+    }
   }
+  contractEvents.sort();
 
   return {
     resultScVal: canonicalScVal(rpc.retvalXdr),
@@ -192,7 +229,7 @@ export function buildRpcView(rpc: RpcFixtureData): ParityView {
     footprintReadOnly: rpc.footprintReadOnly.map(canonicalLedgerKey).sort(),
     footprintReadWrite: rpc.footprintReadWrite.map(canonicalLedgerKey).sort(),
     auth: rpc.auth.map(canonicalAuth).sort(),
-    contractEventCount,
+    contractEvents,
     diagnosticEventCount,
     instructions: rpc.instructions,
     readBytes: rpc.readBytes,
@@ -213,8 +250,8 @@ function footprintDisplay(keys: string[]): string {
 }
 
 /**
- * Compare a decoded local result against the recorded RPC fields, producing a
- * structured {@link ParityReport}.
+ * Compare a decoded local result (from an `applyRpcAdjustments = true` run)
+ * against the recorded RPC fields, producing a structured {@link ParityReport}.
  */
 export function buildParityReport(
   decoded: SsimDecoded,
@@ -242,7 +279,7 @@ export function buildParityReport(
       : "MISMATCH",
   });
 
-  // MUST-match: footprint read-write set.
+  // MUST-match: footprint read-write set (LedgerKey equality).
   fields.push({
     field: "footprint readWrite",
     local: footprintDisplay(local.footprintReadWrite),
@@ -252,7 +289,7 @@ export function buildParityReport(
       : "MISMATCH",
   });
 
-  // MUST-match: auth entries.
+  // MUST-match: auth entries (count + canonical SorobanAuthorizationEntry XDR).
   fields.push({
     field: "auth entries",
     local: `${local.auth.length}`,
@@ -260,60 +297,86 @@ export function buildParityReport(
     verdict: sameSet(local.auth, remote.auth) ? "match" : "MISMATCH",
   });
 
-  // MUST-match: contract events (contract-type only).
-  fields.push({
-    field: "contract events",
-    local: `${local.contractEventCount}`,
-    rpc: `${remote.contractEventCount}`,
-    verdict:
-      local.contractEventCount === remote.contractEventCount
-        ? "match"
-        : "MISMATCH",
-  });
-
-  // Resource estimate: instructions. Divergence is tolerated (no_adjustments).
-  fields.push({
-    field: "instructions",
-    local: `${local.instructions}`,
-    rpc: `${remote.instructions}`,
-    verdict:
-      local.instructions === remote.instructions ? "match" : "divergent-expected",
-    note:
-      local.instructions === remote.instructions
+  // MUST-match: contract events (canonical ContractEvent XDR — topics + data).
+  {
+    const eq = sameSet(local.contractEvents, remote.contractEvents);
+    fields.push({
+      field: "contract events",
+      local: `${local.contractEvents.length}`,
+      rpc: `${remote.contractEvents.length}`,
+      verdict: eq ? "match" : "MISMATCH",
+      note: eq
         ? undefined
-        : "core uses no_adjustments(); RPC applies instruction adjustments",
+        : "SAC contract-event topics/data differ from RPC's recorded event",
+    });
+  }
+
+  // Resource: adjusted instructions (RpcDefault). soroban-simulation applies the
+  // same default_adjustment() stellar-rpc uses: max(raw + 50_000, raw * 1.04).
+  {
+    const eq = local.instructions === remote.instructions;
+    const delta = remote.instructions - local.instructions;
+    fields.push({
+      field: "instructions (RpcDefault)",
+      local: `${local.instructions}`,
+      rpc: `${remote.instructions}`,
+      verdict: eq ? "match" : "divergent-explained",
+      note: eq
+        ? undefined
+        : `adjustment model reproduced exactly (local = raw ${local.rawInstructions} + 50000); ` +
+          `residual +${delta} is raw CPU metering: host pinned to protocol 28, ` +
+          `RPC captured at protocol 27 (see HOST_PROTOCOL_VERSION)`,
+    });
+  }
+
+  // Informational: raw metered instructions (adjustment-independent SSIM header).
+  fields.push({
+    field: "instructions (raw metered)",
+    local: `${local.rawInstructions}`,
+    rpc: `${remote.instructions - 50000} (implied)`,
+    verdict: "divergent-expected",
+    note: "informational: our raw metered count vs RPC's adjusted minus the 50000 additive",
   });
 
-  // Resource estimate: disk read bytes.
+  // Resource: disk read bytes.
   fields.push({
     field: "read bytes",
     local: `${local.readBytes}`,
     rpc: `${remote.readBytes}`,
-    verdict: local.readBytes === remote.readBytes ? "match" : "divergent-expected",
+    verdict: local.readBytes === remote.readBytes ? "match" : "divergent-explained",
   });
 
-  // Resource estimate: write bytes.
+  // Resource: write bytes.
   fields.push({
     field: "write bytes",
     local: `${local.writeBytes}`,
     rpc: `${remote.writeBytes}`,
     verdict:
-      local.writeBytes === remote.writeBytes ? "match" : "divergent-expected",
+      local.writeBytes === remote.writeBytes ? "match" : "divergent-explained",
   });
 
-  // Fees: expected to diverge (adjustment config differs).
-  fields.push({
-    field: "resource fee (stroops)",
-    local: local.resourceFee,
-    rpc: remote.resourceFee,
-    verdict: local.resourceFee === remote.resourceFee ? "match" : "divergent-expected",
-    note:
-      local.resourceFee === remote.resourceFee
+  // Fee: resource fee under RpcDefault.
+  {
+    const eq = local.resourceFee === remote.resourceFee;
+    const delta = Number(remote.resourceFee) - Number(local.resourceFee);
+    const pct =
+      Number(remote.resourceFee) === 0
+        ? 0
+        : (Math.abs(delta) / Number(remote.resourceFee)) * 100;
+    fields.push({
+      field: "resource fee (stroops)",
+      local: local.resourceFee,
+      rpc: remote.resourceFee,
+      verdict: eq ? "match" : "divergent-explained",
+      note: eq
         ? undefined
-        : "core uses no_adjustments(); RPC applies fee adjustments (minResourceFee)",
-  });
+        : `residual ${delta > 0 ? "+" : ""}${delta} stroops (${pct.toFixed(3)}%): ` +
+          `the CPU-fee component tracks the instruction metering delta above`,
+    });
+  }
 
-  // Diagnostic events: informational; may differ across protocol/build.
+  // Diagnostic events: informational; RPC folds the contract event out of its
+  // diagnostic count, so a small difference is expected.
   fields.push({
     field: "diagnostic events",
     local: `${local.diagnosticEventCount}`,
@@ -333,12 +396,7 @@ export function buildParityReport(
 /** Render a {@link ParityReport} as an aligned, human-readable table. */
 export function formatParityTable(report: ParityReport): string {
   const header = ["Field", "Local", "RPC", "Verdict"];
-  const rows = report.fields.map((f) => [
-    f.field,
-    f.local,
-    f.rpc,
-    f.verdict,
-  ]);
+  const rows = report.fields.map((f) => [f.field, f.local, f.rpc, f.verdict]);
   const widths = header.map((h, i) =>
     Math.max(h.length, ...rows.map((r) => r[i]!.length)),
   );

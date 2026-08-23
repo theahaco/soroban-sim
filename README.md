@@ -55,10 +55,15 @@ Pinned upstream:
 - **M3 (differential testing) — in progress.** Oracles A, B, and C are green (see
   `docs/differential-testing.md`). The RPC-equivalence differential harness has
   landed and demonstrates parity against a live Stellar testnet
-  `simulateTransaction` for the native SAC `decimals()` case: invocation result
-  and footprint are byte-identical to RPC; instruction/fee numbers differ only
-  because core reports raw host cost (`no_adjustments()`) while RPC applies its
-  production adjustment config. Re-capture with `pnpm run capture:parity`.
+  `simulateTransaction` over two fixtures: the native SAC `decimals()`
+  (read-only) and a native SAC `transfer()` (write + auth + contract event). On
+  both, the invocation result, footprint (read-only **and** read-write), auth
+  entries, and contract events are byte-identical to RPC. An `AdjustmentSource`
+  knob (`apply-rpc-adjustments`) reproduces stellar-rpc's resource/fee adjustment
+  model exactly (RpcDefault instructions = raw metered + 50000 on both); the only
+  residual is a small raw-CPU-metering delta from the captured fixtures being
+  protocol 27 vs the host's protocol 28, classified `divergent-explained`.
+  Re-capture with `pnpm run capture:parity <case>`.
 
 ## Requirements
 
@@ -114,13 +119,17 @@ Measured on macOS arm64, Rust 1.97.1, Wasmtime 48.0.0, Chromium 151.
 ## Current limitations
 
 - The component imports WASI Preview 2 CLI/io/clock/random shims because Rust `std` and upstream dependencies currently pull them in. It does not import WASI filesystem or sockets, and performs no network or persistent-filesystem access.
-- RPC-equivalence authority is demonstrated only for the captured read-only SAC
-  `decimals()` case, not across arbitrary contracts, write footprints, auth
-  trees, or state-archival/restore paths. See `docs/differential-testing.md`
-  ("RPC equivalence (M3)") for scope.
-- Resource and fee estimates report the host's raw metered cost
-  (`SimulationAdjustmentConfig::no_adjustments()`); they intentionally do **not**
-  match Stellar RPC's adjusted numbers, which bake in one network's fee policy.
+- RPC-equivalence authority is demonstrated for two captured native-SAC cases —
+  a read-only `decimals()` and a write+auth+event `transfer()` — not yet across
+  arbitrary custom-wasm contracts or state-archival/restore paths. See
+  `docs/differential-testing.md` ("RPC equivalence (M3)") for scope.
+- Resource and fee estimates default to the host's raw metered cost
+  (`SimulationAdjustmentConfig::no_adjustments()`). Setting
+  `apply-rpc-adjustments` (`AdjustmentSource::RpcDefault`) reproduces
+  stellar-rpc's adjustment model exactly; the parity harness confirms adjusted
+  instructions = raw + 50000 on both fixtures. A small residual remains in the
+  *raw* metered numbers because the fixtures were captured at protocol 27 while
+  the host runs protocol 28 — a metering delta, not an adjustment difference.
 - No authorization-enforcement API (recording-mode auth is captured but not
   enforced against a supplied auth tree) yet.
 

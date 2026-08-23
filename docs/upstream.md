@@ -173,16 +173,30 @@ both handled locally without a fork:
   `needs-state` trips. This confirms the config-prefetch mitigation in the design
   spec and the `load_from_snapshot` note above.
 
-- **Adjustment-config alignment is the sole source of resource/fee divergence.**
-  `soroban-sim-core` runs with `SimulationAdjustmentConfig::no_adjustments()` and
-  reports the host's raw metered instructions/fee; Stellar RPC applies its
-  production `SimulationAdjustmentConfig` (instruction ~2.16x and fee safety
-  multipliers). For the captured SAC `decimals()` case this is the *only*
-  difference — result, footprint, auth, and events are byte-identical. If future
-  work wants RPC-matching resource/fee numbers rather than raw host cost, the
-  clean lever is to expose the adjustment config to callers instead of hard-coding
-  `no_adjustments()`; the raw numbers remain the correct default for a portable
-  simulator that must not bake in one network's fee policy.
+- **The adjustment config is the RPC-parity lever — now exposed to callers.**
+  `soroban-simulation`'s `SimulationAdjustmentConfig` is what separates raw host
+  cost from stellar-rpc's reported numbers. `soroban-sim-core` now exposes it as
+  an `AdjustmentSource` enum (`None` → `no_adjustments()`, the portable default;
+  `RpcDefault` → `default_adjustment()`, reproducing stellar-rpc preflight),
+  surfaced over the WIT boundary as `apply-rpc-adjustments: bool`. Two findings
+  from wiring this up:
+  - **`no_adjustments()` vs `default_adjustment()` is the whole difference for
+    the value/footprint/auth/event surface.** Under either config, result,
+    footprint (RO+RW), auth entries, and contract events are byte-identical to
+    RPC on both parity fixtures. Only the reported resources/fee move.
+  - **`default_adjustment()`'s instruction rule is `max(raw + 50_000,
+    raw × 1.04)`; the `+50_000` additive dominates at contract-call
+    magnitudes.** Confirmed: `RpcDefault` instructions = raw metered + 50000
+    exactly on both fixtures. This means the knob reproduces stellar-rpc's
+    adjustment *model* precisely — any remaining RPC-number gap is in the raw
+    metering, not the adjustment. (Note the SSIM `simulated_instructions` header
+    stays the raw count regardless of the flag; the adjusted number is encoded in
+    `SorobanTransactionData`.) The residual on the captured fixtures is a
+    protocol-27-vs-28 raw-metering delta, appearing identically in both the raw
+    and adjusted numbers — see the `check_ledger_protocol_supported` note below.
+  The raw numbers remain the correct default for a portable simulator that must
+  not bake in one network's fee policy; `RpcDefault` is opt-in for callers who
+  want RPC-matching output.
 
 - **`check_ledger_protocol_supported` hard-pins the host to its own protocol.**
   The recording-mode setup guard (`Host::set_ledger_info` →

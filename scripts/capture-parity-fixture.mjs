@@ -61,6 +61,7 @@ const {
   BASE_FEE,
   Asset,
   scValToNative,
+  nativeToScVal,
 } = sdk;
 
 // --------------------------------------------------------------------------
@@ -73,8 +74,26 @@ const CASES = {
     file: "native-sac-decimals.json",
     contractId: (passphrase) => Asset.native().contractId(passphrase),
     functionName: "decimals",
-    args: [],
+    // buildArgs receives runtime context and returns ScVal[] passed to both
+    // contract.call(...) and the canonical InvokeContractArgs.
+    buildArgs: () => [],
     expectedNative: 7,
+  },
+  // WRITE+AUTH parity case (#18): native SAC `transfer(from=A, to=B, amount=1)`.
+  // A is the tx source account (so A is the required authorizer). Both A and B
+  // are funded via friendbot so their classic account entries exist on-ledger;
+  // the transfer mutates both native balances → read-write footprint, records
+  // A's auth, and emits the SAC "transfer" contract event.
+  "native-sac-transfer": {
+    file: "native-sac-transfer.json",
+    contractId: (passphrase) => Asset.native().contractId(passphrase),
+    functionName: "transfer",
+    needsDestination: true,
+    buildArgs: ({ sourceKp, destKp }) => [
+      new Address(sourceKp.publicKey()).toScVal(),
+      new Address(destKp.publicKey()).toScVal(),
+      nativeToScVal(1n, { type: "i128" }),
+    ],
   },
 };
 
@@ -169,16 +188,29 @@ async function main() {
   // 1. Throwaway source account, funded via friendbot.
   const kp = Keypair.random();
   console.log(`  source: ${kp.publicKey()} (funding via friendbot)`);
-  await withRetry("friendbot", async () => {
-    const res = await fetch(`${FRIENDBOT_URL}/?addr=${encodeURIComponent(kp.publicKey())}`);
-    if (!res.ok) throw new Error(`friendbot HTTP ${res.status}`);
-    return res;
-  });
+  const fundViaFriendbot = (addr) =>
+    withRetry(`friendbot(${addr.slice(0, 6)}…)`, async () => {
+      const res = await fetch(`${FRIENDBOT_URL}/?addr=${encodeURIComponent(addr)}`);
+      if (!res.ok) throw new Error(`friendbot HTTP ${res.status}`);
+      return res;
+    });
+  await fundViaFriendbot(kp.publicKey());
   const account = await withRetry("getAccount", () => server.getAccount(kp.publicKey()));
+
+  // Optional destination account (WRITE+AUTH cases like the SAC transfer): fund
+  // it too so its classic account entry exists on-ledger and lands in the
+  // read-write footprint.
+  let destKp = null;
+  if (spec.needsDestination) {
+    destKp = Keypair.random();
+    console.log(`  destination: ${destKp.publicKey()} (funding via friendbot)`);
+    await fundViaFriendbot(destKp.publicKey());
+    await withRetry("getAccount(dest)", () => server.getAccount(destKp.publicKey()));
+  }
 
   // 2. Build the invoke transaction.
   const contract = new Contract(contractId);
-  const args = spec.args.map((a) => (typeof a === "function" ? a(sdk) : a));
+  const args = spec.buildArgs({ sdk, sourceKp: kp, destKp, Address, xdr, nativeToScVal });
   const tx = new TransactionBuilder(account, {
     fee: BASE_FEE,
     networkPassphrase: PASSPHRASE,
@@ -324,6 +356,7 @@ async function main() {
     txXdr,
     hostFunctionXdr,
     sourceAccount: kp.publicKey(),
+    ...(destKp ? { destinationAccount: destKp.publicKey() } : {}),
     ledgerContext,
     snapshot,
     rpc: {
