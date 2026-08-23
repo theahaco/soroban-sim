@@ -324,8 +324,9 @@ export function buildParityReport(
       note: eq
         ? undefined
         : `adjustment model reproduced exactly (local = raw ${local.rawInstructions} + 50000); ` +
-          `residual +${delta} is raw CPU metering: host pinned to protocol 28, ` +
-          `RPC captured at protocol 27 (see HOST_PROTOCOL_VERSION)`,
+          `residual +${delta} is a raw CPU-metering skew between our pinned soroban-env-host ` +
+          `28.0.2 and the RPC core's env-host build (the local protocol-28 quickstart core embeds ` +
+          `env-host 28.0.0; testnet fixtures additionally span protocol 27 vs 28)`,
     });
   }
 

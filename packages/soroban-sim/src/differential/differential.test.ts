@@ -17,17 +17,21 @@
  * outright `MISMATCH`. Resource/fee residuals are classified `divergent-explained`
  * (documented, non-zero) — never silently force-passed.
  *
- * ── Protocol version note (a real finding, not papered over) ────────────────
- * The fixtures were captured against Stellar testnet at ledger protocol 27, but
- * `soroban-sim-core` links `soroban-env-host` 28.0.2, whose network interface
- * protocol is 28. The host's replay-safety guard (`check_ledger_protocol_supported`,
- * invoked from `Host::set_ledger_info` during recording setup) rejects *any*
- * ledger protocol != 28 with a bare `Error(Context, InternalError)`. The harness
- * therefore pins the ledger context to the host's supported protocol (28) when
- * driving the local simulation; this is `HOST_PROTOCOL_VERSION` below. RESULT,
- * FOOTPRINT, AUTH and EVENT parity are unaffected, but the raw CPU *instruction
- * metering* differs between protocol 27 and 28 — which is exactly the residual
- * delta the `instructions (RpcDefault)` field documents.
+ * ── Protocol / env-host version note (real findings, not papered over) ──────
+ * The two `native-sac-*` fixtures were captured against Stellar testnet at ledger
+ * protocol 27, while `soroban-sim-core` links `soroban-env-host` 28.0.2 (protocol
+ * 28). The host's replay-safety guard (`check_ledger_protocol_supported`, from
+ * `Host::set_ledger_info` during recording setup) rejects *any* ledger protocol
+ * != 28 with a bare `Error(Context, InternalError)`, so the harness pins the
+ * ledger context to 28 (`HOST_PROTOCOL_VERSION`).
+ *
+ * `local-add-i32` was captured against a LOCAL protocol-28 quickstart node, so
+ * protocol matches on both sides — yet a small raw-instruction residual remains.
+ * Root cause (grounded via `stellar-core version`): that quickstart core embeds
+ * soroban-env-host 28.0.0, whereas we pin 28.0.2 — a patch-level CPU-metering
+ * calibration difference. In all cases RESULT / FOOTPRINT / AUTH / EVENT / bytes
+ * are byte-equal; only the raw instruction count (and the CPU-fee component that
+ * tracks it) diverges, which the `instructions (RpcDefault)` field documents.
  */
 import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -127,6 +131,9 @@ function loadFixture(name: string): ParityFixture {
 const FIXTURES = [
   { name: "native-sac-decimals", expectRw: false, expectAuth: false },
   { name: "native-sac-transfer", expectRw: true, expectAuth: true },
+  // Captured against a LOCAL protocol-28 quickstart node (custom add-i32 wasm),
+  // matching the host's pinned protocol — the residual-closing case.
+  { name: "local-add-i32", expectRw: false, expectAuth: false },
 ] as const;
 
 describe("RPC equivalence (RpcDefault adjustments)", () => {

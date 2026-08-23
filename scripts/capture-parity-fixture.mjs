@@ -95,12 +95,51 @@ const CASES = {
       nativeToScVal(1n, { type: "i128" }),
     ],
   },
+  // CUSTOM-WASM parity case (#14 / protocol-28 residual): the add-i32 fixture
+  // contract's read-only `add(a: i32, b: i32) -> i32`. The contract is not a
+  // built-in SAC, so it must be deployed first; its contract id is supplied at
+  // capture time via LOCAL_CONTRACT_ID (see docs/local-rpc-parity.md). Intended
+  // to run against a local protocol-28 quickstart RPC so the captured raw
+  // instruction/fee metering matches soroban-sim's pinned host (protocol 28),
+  // closing the cross-protocol residual the testnet(p27) fixtures document.
+  "local-add-i32": {
+    file: "local-add-i32.json",
+    // Contract id is a deployed instance, independent of the network passphrase.
+    contractId: () => {
+      const id = process.env.LOCAL_CONTRACT_ID;
+      if (!id) {
+        throw new Error(
+          "local-add-i32 requires LOCAL_CONTRACT_ID=<C...> (the deployed add-i32 contract id); " +
+            "see docs/local-rpc-parity.md",
+        );
+      }
+      return id;
+    },
+    functionName: "add",
+    // add(a=7, b=35) -> 42. i32 args; result is a deterministic i32.
+    buildArgs: () => [
+      nativeToScVal(7, { type: "i32" }),
+      nativeToScVal(35, { type: "i32" }),
+    ],
+    expectedNative: 42,
+  },
 };
 
 const RPC_URL = process.env.SOROBAN_RPC_URL ?? "https://soroban-testnet.stellar.org";
 const FRIENDBOT_URL = process.env.FRIENDBOT_URL ?? "https://friendbot.stellar.org";
-const NETWORK = "testnet";
-const PASSPHRASE = Networks.TESTNET;
+// Plain-http localhost (e.g. the `stellar container` quickstart node at
+// http://localhost:8000/rpc) requires opting into non-TLS transport. The v17
+// SDK's rpc.Server throws on http:// URLs unless `allowHttp: true` is passed.
+const ALLOW_HTTP = process.env.SOROBAN_ALLOW_HTTP === "1";
+// Human-readable label persisted into the fixture's `network` field. For a local
+// protocol-28 quickstart node set SOROBAN_NETWORK=local-p28 so the fixture is
+// unambiguously tagged as captured off the local RPC (vs public testnet).
+const NETWORK = process.env.SOROBAN_NETWORK ?? "testnet";
+// The network passphrase governs signing + networkId + native-SAC contractId
+// derivation. Public testnet uses Networks.TESTNET; a `stellar container`
+// standalone/local node uses "Standalone Network ; February 2017". Override via
+// SOROBAN_NETWORK_PASSPHRASE for local captures.
+const PASSPHRASE = process.env.SOROBAN_NETWORK_PASSPHRASE ?? Networks.TESTNET;
 
 // The full set of ConfigSetting IDs that NetworkConfig::load_from_snapshot reads
 // (mirrors crates/soroban-sim-core/tests/network_config.rs). Capturing all of
@@ -179,9 +218,9 @@ async function main() {
     throw new Error(`unknown case '${caseName}'. Known: ${Object.keys(CASES).join(", ")}`);
   }
   console.log(`Capturing parity fixture: ${caseName}`);
-  console.log(`  RPC: ${RPC_URL}  network: ${NETWORK}`);
+  console.log(`  RPC: ${RPC_URL}  network: ${NETWORK}  allowHttp: ${ALLOW_HTTP}`);
 
-  const server = new rpc.Server(RPC_URL);
+  const server = new rpc.Server(RPC_URL, ALLOW_HTTP ? { allowHttp: true } : undefined);
   const contractId = spec.contractId(PASSPHRASE);
   console.log(`  contract: ${contractId} fn: ${spec.functionName}()`);
 
