@@ -11,7 +11,17 @@
     ".": "./src/index.ts",
     "./generated": "./src/generated/soroban-sim-component.js"
   },
+  "scripts": {
+    "test": "vitest run",
+    "check": "tsc --noEmit"
+  },
   "dependencies": {
-    "@bytecodealliance/preview2-shim": "^0.17.2"
+    "@bytecodealliance/preview2-shim": "^0.17.2",
+    "@stellar/stellar-sdk": "^17.0.0"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "^6.2.5",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
   }
 }

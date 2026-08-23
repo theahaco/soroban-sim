@@ -12,25 +12,41 @@ world simulator {
         max-entry-ttl: u32,
     }
 
+    // A ledger entry the caller KNOWS is present. entry-xdr is stellar-xdr LedgerEntry;
+    // live-until-ledger MUST be set for ContractData/ContractCode (host requires a TTL).
     record ledger-entry {
         entry-xdr: list<u8>,
         live-until-ledger: option<u32>,
     }
 
     record request {
-        host-function-xdr: list<u8>,
-        source-account-xdr: list<u8>,
+        host-function-xdr: list<u8>,        // stellar-xdr HostFunction (transaction XDR deferred)
+        source-account-xdr: list<u8>,       // stellar-xdr AccountId
         ledger-context: ledger-context,
-        ledger-entries: list<ledger-entry>,
+        ledger-entries: list<ledger-entry>, // present entries (incl. any ConfigSetting entries)
+        known-absent-keys: list<list<u8>>,  // LedgerKey XDR proven absent -> Ok(None)
+        base-prng-seed: list<u8>,
+        enable-diagnostics: bool,
+    }
+
+    // Same as `request` but driven from a full Stellar TransactionEnvelope: the
+    // host-function + source-account are extracted from the InvokeHostFunction
+    // operation instead of being supplied pre-split.
+    record transaction-request {
+        transaction-xdr: list<u8>,          // stellar-xdr TransactionEnvelope
+        ledger-context: ledger-context,
+        ledger-entries: list<ledger-entry>, // present entries (incl. any ConfigSetting entries)
+        known-absent-keys: list<list<u8>>,  // LedgerKey XDR proven absent -> Ok(None)
         base-prng-seed: list<u8>,
         enable-diagnostics: bool,
     }
 
     variant outcome {
-        complete(list<u8>),
-        needs-state(list<list<u8>>),
+        complete(list<u8>),                 // deterministic SSIM-encoded result (success OR contract failure encoded inline)
+        needs-state(list<list<u8>>),        // LedgerKey XDR that were Unknown; refetch and rerun
     }
 
     export simulate: func(request: request) -> result<outcome, string>;
+    export simulate-transaction: func(request: transaction-request) -> result<outcome, string>;
     export run-fixture: func() -> result<list<u8>, string>;
 }

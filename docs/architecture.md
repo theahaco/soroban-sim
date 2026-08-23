@@ -28,16 +28,26 @@ Individual contracts stay normal Soroban core Wasm. The host loads contract code
 `wit/simulator.wit` exports:
 
 - `run-fixture() -> result<list<u8>, string>` for Milestone 0 proof.
-- `simulate(request) -> result<outcome, string>` for early host-function simulation.
+- `simulate(request) -> result<outcome, string>` for host-function simulation.
 
 The request carries XDR bytes for host function, source account, and ledger entries. Ledger context is a small WIT record because `LedgerInfo` is host-side context, not Stellar XDR.
 
-Milestone 0 keeps network costs in a deterministic Rust fixture config. Later interface revision should encode network config as either:
+`request` fields:
 
-1. config-setting ledger entries loaded through `NetworkConfig::load_from_snapshot`; or
-2. a canonical local byte encoding for `NetworkConfig`.
+- `host-function-xdr` / `source-account-xdr`: stellar-xdr `HostFunction` and `AccountId` (transaction-envelope XDR is deferred past M1).
+- `ledger-context`: host-side `LedgerInfo`.
+- `ledger-entries`: entries the caller **knows are present**, each with an optional `live-until-ledger`. `ContractData` / `ContractCode` entries MUST carry a TTL or the host aborts. Any `ConfigSetting` entries live here too (see network config below).
+- `known-absent-keys: list<list<u8>>`: `LedgerKey` XDR the caller has **proven absent**. These map to `Ok(None)` in the snapshot and are never re-emitted as needs-state, which is what stops the rerun loop from re-requesting a confirmed-absent key.
+- `base-prng-seed`, `enable-diagnostics`: determinism + diagnostic-event toggle.
 
-Avoid pretending this is Stellar XDR until an actual XDR type exists.
+`outcome` is a variant:
+
+- `complete(list<u8>)`: the deterministic SSIM-encoded result. A genuine contract failure is encoded **inline** here (not surfaced as an error).
+- `needs-state(list<list<u8>>)`: `LedgerKey` XDR that were read while Unknown. The caller refetches them and reruns.
+
+`result::err(string)` is reserved for real decode / infrastructure errors, never for missing state.
+
+Network config is loaded from `ConfigSetting` ledger entries supplied through `ledger-entries` (via `NetworkConfig::load_from_snapshot`), so it is **not** a WIT field. There is no canonical `NetworkConfig` XDR to encode; config settings are ordinary fetchable state, so a missing one produces needs-state like any other key. The component sets `NetworkConfigSource::FromLedgerEntries`; the fixture / native complete-snapshot path uses an explicit fixture config to keep the golden stable.
 
 ## Fixture execution path
 
@@ -53,24 +63,32 @@ The M0 fixture:
 
 ## State-loading model for Milestone 1
 
-Snapshot lookups must distinguish:
+Snapshot lookups distinguish three states, supplied by the caller through the request:
 
-- present: ledger entry plus actual TTL;
-- absent: known absence;
-- unknown: cache miss / not yet resolved.
+- **present**: ledger entry plus actual TTL (`ledger-entries`);
+- **absent**: proven absence (`known-absent-keys`), returned to the host as `Ok(None)`;
+- **unknown**: neither supplied — a cache miss / not yet resolved.
 
-`SnapshotSource::get` returns `Option<EntryWithLiveUntil>`, so `None` already means absent to the host. Unknown cannot be represented as `None`.
+`SnapshotSource::get` returns `Option<EntryWithLiveUntil>`, so `None` already means absent to the host. Unknown cannot be represented as `None`, so it is handled out of band.
 
-Planned local protocol:
+`ThreeStateSnapshot` (in `crates/soroban-sim-core/src/snapshot.rs`) implements this:
 
-1. Snapshot source stores `Present`, `Absent`, or `Unknown` per key.
-2. On unknown lookup, it records ledger-key XDR and aborts with a recognizable host error.
-3. Wrapper sees recorded missing keys and returns `outcome::needs-state(keys)` instead of a completed simulation failure.
-4. JavaScript fetches keys asynchronously via RPC or another provider.
-5. Response, including known absence, is persisted in IndexedDB under exact context.
-6. Simulation reruns deterministically from the beginning.
+1. A key in `ledger-entries` resolves to `Ok(Some(entry))`; a key in `known-absent-keys` resolves to `Ok(None)`.
+2. Any other key follows `UnmappedPolicy`. The WIT `simulate` path uses `UnmappedPolicy::Unknown` (fail-closed): the key XDR is recorded into a `RefCell<BTreeSet<LedgerKey>>` buffer and `get` returns the **sentinel** error `(ScErrorType::Storage, ScErrorCode::ExceededLimit)`. The fixture / complete-snapshot path uses `UnmappedPolicy::Absent`, matching the old in-memory source and preserving the golden.
+3. The sentinel is chosen because it is non-recoverable (a nested `try_call` cannot swallow it), is never produced by the env-host in recording mode, and survives error decoration unchanged.
 
-First implementation can discover one key per run. Batching comes after correctness.
+**Needs-state classification is buffer-authoritative.** A `get` error does not surface as the outer `Result::Err` of `simulate_invoke_host_function_op`; the host's post-invocation footprint re-scan returns `Ok(result)` with `invoke_result = Err(sentinel)`. So after the call the core checks `probe.take_needed()` **first**: if the recorded-keys buffer is non-empty the outcome is `NeedsState(keys)`; otherwise it is `Complete` (a genuine contract failure is encoded inline in the Complete bytes). The buffer — written only by our `get` — is the sole needs-state trigger; `is_unknown_state_error` is only a debug aid.
+
+Local protocol:
+
+1. The snapshot source classifies each key `Present` / `Absent` / `Unknown` from the request.
+2. On an Unknown lookup it records the ledger-key XDR and aborts with the sentinel.
+3. The wrapper maps a non-empty recorded-key set to `outcome::needs-state(keys)` (LedgerKey XDR).
+4. JavaScript fetches those keys asynchronously via RPC or another provider.
+5. The response, including known absence, is persisted in IndexedDB under the exact context and fed back as `ledger-entries` / `known-absent-keys` on rerun.
+6. Simulation reruns deterministically from the beginning; feeding refetched-absent keys as `known-absent-keys` guarantees they are not re-requested, so the loop terminates.
+
+First implementation discovers one key per run (the sentinel aborts on the first Unknown read). Batching comes after correctness.
 
 ## Cache identity
 
@@ -81,6 +99,8 @@ Browser cache keys must include:
 - optional transaction hash / transaction position;
 - ledger-key XDR hash;
 - protocol version where needed.
+
+The cache is **tri-state**: present entries (with their real TTL) and explicit absent markers are both stored. Caching absence is required — a confirmed-absent key must be feedable as `known-absent-keys` on rerun so it is never re-requested, otherwise the needs-state loop cannot terminate.
 
 TTL must be preserved from source data. No synthetic `u32::MAX` TTL for transaction simulation.
 

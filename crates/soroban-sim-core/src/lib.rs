@@ -2,23 +2,27 @@ use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use soroban_env_host::e2e_invoke::RecordingInvocationAuthMode;
 use soroban_env_host::fees::{FeeConfiguration, RentFeeConfiguration};
-use soroban_env_host::storage::{EntryWithLiveUntil, SnapshotSource};
 use soroban_env_host::xdr::{
-    AccountId, ContractCodeEntry, ContractCodeEntryExt, ContractCostParamEntry, ContractCostParams,
-    ContractCostType, ContractDataDurability, ContractDataEntry, ContractExecutable, ContractId,
-    ExtensionPoint, Hash, HostFunction, InvokeContractArgs, LedgerEntry, LedgerEntryData,
-    LedgerEntryExt, LedgerKey, LedgerKeyAccount, LedgerKeyConfigSetting, LedgerKeyContractCode,
-    LedgerKeyContractData, Limits, PublicKey, ReadXdr, ScAddress, ScContractInstance, ScVal,
-    Uint256, VecM, WriteXdr,
+    AccountEntry, AccountEntryExt, AccountId, ContractCodeEntry, ContractCodeEntryExt,
+    ContractCostParamEntry, ContractCostParams, ContractCostType, ContractDataDurability,
+    ContractDataEntry, ContractExecutable, ContractId, ExtensionPoint, Hash, HostFunction,
+    InvokeContractArgs, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey, LedgerKeyAccount,
+    InvokeHostFunctionOp, LedgerKeyConfigSetting, LedgerKeyContractCode, LedgerKeyContractData,
+    Limits, Memo, MuxedAccount, Operation, OperationBody, Preconditions, PublicKey, ReadXdr,
+    ScAddress, ScContractInstance, ScMap, ScMapEntry, ScSymbol, ScVal, SequenceNumber, String32,
+    Thresholds, Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256,
+    VecM, WriteXdr,
 };
-use soroban_env_host::{meta, HostError, LedgerInfo, DEFAULT_XDR_RW_LIMITS};
+use soroban_env_host::{meta, LedgerInfo, DEFAULT_XDR_RW_LIMITS};
 use soroban_simulation::simulation::{
     simulate_invoke_host_function_op, InvokeHostFunctionSimulationResult, LedgerEntryDiff,
     SimulationAdjustmentConfig,
 };
 use soroban_simulation::NetworkConfig;
-use std::collections::BTreeMap;
 use std::rc::Rc;
+
+mod snapshot;
+pub use snapshot::*;
 
 pub const FIXTURE_A: i32 = 40;
 pub const FIXTURE_B: i32 = 2;
@@ -29,6 +33,20 @@ pub const FIXTURE_NETWORK_ID: [u8; 32] = [5; 32];
 pub const FIXTURE_PRNG_SEED: [u8; 32] = *b"soroban-sim-milestone-0-seed!!!!";
 
 pub const FIXTURE_CONTRACT_WASM: &[u8] = include_bytes!("../../../fixtures/contracts/add_i32.wasm");
+
+/// The `storage` fixture contract (persistent/temporary/instance storage read+write).
+pub const STORAGE_CONTRACT_WASM: &[u8] =
+    include_bytes!("../../../fixtures/contracts/storage.wasm");
+/// The `caller` fixture contract (cross-contract `invoke_contract`).
+pub const CALLER_CONTRACT_WASM: &[u8] = include_bytes!("../../../fixtures/contracts/caller.wasm");
+
+/// Contract id for the `storage` fixture.
+pub const STORAGE_CONTRACT_ID: [u8; 32] = [11; 32];
+/// Contract id for the `caller` fixture.
+pub const CALLER_CONTRACT_ID: [u8; 32] = [22; 32];
+/// Contract id for the `add-i32` callee reused by the nested-call tests
+/// (same wasm as [`FIXTURE_CONTRACT_WASM`], distinct address).
+pub const CALLEE_CONTRACT_ID: [u8; 32] = FIXTURE_CONTRACT_ID;
 
 #[derive(Clone, Debug)]
 pub struct LedgerEntryWithLiveUntil {
@@ -41,48 +59,73 @@ pub struct SimulationRequest {
     pub host_function: HostFunction,
     pub source_account: AccountId,
     pub ledger_info: LedgerInfo,
-    pub network_config: NetworkConfig,
+    pub network_config: NetworkConfigSource,
     pub ledger_entries: Vec<LedgerEntryWithLiveUntil>,
+    pub absent_keys: Vec<LedgerKey>,
+    pub unmapped_policy: UnmappedPolicy,
     pub base_prng_seed: [u8; 32],
     pub enable_diagnostics: bool,
 }
 
-#[derive(Default)]
-pub struct InMemorySnapshotSource {
-    map: BTreeMap<Rc<LedgerKey>, EntryWithLiveUntil>,
+/// Outcome of a single simulation pass.
+///
+/// `Complete` carries the deterministic SSIM-encoded result (a genuine contract
+/// failure is encoded inline, not surfaced here). `NeedsState` carries the
+/// `LedgerKey`s that were read while Unknown and must be refetched before rerun.
+#[derive(Debug)]
+pub enum SimOutcome {
+    Complete(Vec<u8>),
+    NeedsState(Vec<LedgerKey>),
 }
 
-impl InMemorySnapshotSource {
-    pub fn from_entries(entries: Vec<LedgerEntryWithLiveUntil>) -> Result<Self> {
-        let mut map = BTreeMap::<Rc<LedgerKey>, EntryWithLiveUntil>::new();
-        for entry in entries {
-            let key = Rc::new(ledger_entry_to_ledger_key(&entry.entry)?);
-            map.insert(key, (Rc::new(entry.entry), entry.live_until_ledger));
-        }
-        Ok(Self { map })
-    }
-}
-
-impl SnapshotSource for InMemorySnapshotSource {
-    fn get(
-        &self,
-        key: &Rc<LedgerKey>,
-    ) -> std::result::Result<Option<EntryWithLiveUntil>, HostError> {
-        Ok(self.map.get(key).cloned())
-    }
+/// Where the network configuration comes from.
+///
+/// `Explicit` uses a caller-provided `NetworkConfig` (fixture / complete-snapshot
+/// path). `FromLedgerEntries` reads the `ConfigSetting` entries out of the same
+/// three-state snapshot via `NetworkConfig::load_from_snapshot`.
+#[derive(Debug)]
+pub enum NetworkConfigSource {
+    Explicit(NetworkConfig),
+    FromLedgerEntries,
 }
 
 pub fn run_fixture() -> Result<Vec<u8>> {
-    simulate(fixture_request()?)
+    match simulate(fixture_request()?)? {
+        SimOutcome::Complete(bytes) => Ok(bytes),
+        SimOutcome::NeedsState(keys) => {
+            bail!("fixture simulation unexpectedly needs {} more entries", keys.len())
+        }
+    }
 }
 
-pub fn simulate(request: SimulationRequest) -> Result<Vec<u8>> {
-    let snapshot = Rc::new(InMemorySnapshotSource::from_entries(
+pub fn simulate(request: SimulationRequest) -> Result<SimOutcome> {
+    let snapshot = Rc::new(ThreeStateSnapshot::new(
         request.ledger_entries,
+        request.absent_keys,
+        request.unmapped_policy,
     )?);
+    // Shares the same RefCell needs-state buffer as `snapshot`.
+    let probe = snapshot.clone();
+
+    let network_config = match request.network_config {
+        NetworkConfigSource::Explicit(config) => config,
+        NetworkConfigSource::FromLedgerEntries => {
+            match NetworkConfig::load_from_snapshot(snapshot.as_ref()) {
+                Ok(config) => config,
+                Err(err) => {
+                    let needed = probe.take_needed();
+                    if !needed.is_empty() {
+                        return Ok(SimOutcome::NeedsState(needed));
+                    }
+                    return Err(err).context("loading network config from ledger entries");
+                }
+            }
+        }
+    };
+
     let result = simulate_invoke_host_function_op(
         snapshot,
-        &request.network_config,
+        &network_config,
         &SimulationAdjustmentConfig::no_adjustments(),
         &request.ledger_info,
         request.host_function,
@@ -92,7 +135,96 @@ pub fn simulate(request: SimulationRequest) -> Result<Vec<u8>> {
         request.enable_diagnostics,
     )
     .context("soroban-simulation failed")?;
-    encode_simulation_result(&result)
+
+    // The recorded-keys buffer is the authoritative needs-state signal, checked
+    // before treating invoke_result as a genuine contract failure.
+    let needed = probe.take_needed();
+    if !needed.is_empty() {
+        return Ok(SimOutcome::NeedsState(needed));
+    }
+    Ok(SimOutcome::Complete(encode_simulation_result(&result)?))
+}
+
+/// Extract the `HostFunction` of the first `InvokeHostFunction` operation and
+/// the source `AccountId` from a `TransactionEnvelope`.
+///
+/// The source account is the operation's own source when present, otherwise the
+/// transaction source (matching how Stellar attributes an operation's source).
+///
+/// Errors clearly when:
+///   - the envelope is a v0 or fee-bump envelope (no direct Soroban invoke),
+///   - the transaction carries no `InvokeHostFunction` operation, or
+///   - the applicable source account is a muxed (`M...`) address.
+pub fn extract_invoke_host_function(
+    tx_envelope: &TransactionEnvelope,
+) -> Result<(HostFunction, AccountId)> {
+    let tx = match tx_envelope {
+        TransactionEnvelope::Tx(TransactionV1Envelope { tx, .. }) => tx,
+        TransactionEnvelope::TxV0(_) => bail!(
+            "unsupported transaction envelope: v0 (pre-Protocol 13) envelopes cannot carry a \
+             Soroban InvokeHostFunction operation"
+        ),
+        TransactionEnvelope::TxFeeBump(_) => bail!(
+            "unsupported transaction envelope: fee-bump transactions are not supported; \
+             simulate the inner transaction instead"
+        ),
+    };
+
+    let (op_source, host_function) = tx
+        .operations
+        .iter()
+        .find_map(|op| match &op.body {
+            OperationBody::InvokeHostFunction(invoke) => {
+                Some((op.source_account.as_ref(), invoke.host_function.clone()))
+            }
+            _ => None,
+        })
+        .ok_or_else(|| anyhow!("transaction has no InvokeHostFunction operation"))?;
+
+    let source = op_source.unwrap_or(&tx.source_account);
+    let source_account = muxed_to_account_id(source)?;
+    Ok((host_function, source_account))
+}
+
+fn muxed_to_account_id(muxed: &MuxedAccount) -> Result<AccountId> {
+    match muxed {
+        MuxedAccount::Ed25519(key) => Ok(AccountId(PublicKey::PublicKeyTypeEd25519(key.clone()))),
+        MuxedAccount::MuxedEd25519(_) => bail!(
+            "muxed (M...) source accounts are not supported; use the underlying ed25519 (G...) \
+             account"
+        ),
+    }
+}
+
+/// Transaction-envelope entry point: extract the `InvokeHostFunction` host
+/// function + source account from `tx_envelope` and run [`simulate`] over them.
+///
+/// Purely additive over [`simulate`] — same three-state snapshot / needs-state
+/// semantics, driven from a full Stellar `TransactionEnvelope` instead of a
+/// pre-split host-function + source-account pair.
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_transaction(
+    tx_envelope: TransactionEnvelope,
+    ledger_info: LedgerInfo,
+    network_config: NetworkConfigSource,
+    ledger_entries: Vec<LedgerEntryWithLiveUntil>,
+    absent_keys: Vec<LedgerKey>,
+    unmapped_policy: UnmappedPolicy,
+    base_prng_seed: [u8; 32],
+    enable_diagnostics: bool,
+) -> Result<SimOutcome> {
+    let (host_function, source_account) = extract_invoke_host_function(&tx_envelope)?;
+    simulate(SimulationRequest {
+        host_function,
+        source_account,
+        ledger_info,
+        network_config,
+        ledger_entries,
+        absent_keys,
+        unmapped_policy,
+        base_prng_seed,
+        enable_diagnostics,
+    })
 }
 
 pub fn fixture_request() -> Result<SimulationRequest> {
@@ -102,7 +234,7 @@ pub fn fixture_request() -> Result<SimulationRequest> {
         host_function: fixture_host_function()?,
         source_account: account_id(FIXTURE_SOURCE_ACCOUNT),
         ledger_info,
-        network_config: fixture_network_config(),
+        network_config: NetworkConfigSource::Explicit(fixture_network_config()),
         ledger_entries: vec![
             LedgerEntryWithLiveUntil {
                 entry: fixture_contract_code_entry()?,
@@ -113,6 +245,8 @@ pub fn fixture_request() -> Result<SimulationRequest> {
                 live_until_ledger: live_until,
             },
         ],
+        absent_keys: vec![],
+        unmapped_policy: UnmappedPolicy::Absent,
         base_prng_seed: FIXTURE_PRNG_SEED,
         enable_diagnostics: true,
     })
@@ -188,6 +322,32 @@ pub fn fixture_host_function() -> Result<HostFunction> {
     }))
 }
 
+/// Build a v1 `TransactionEnvelope` whose single operation invokes the add-i32
+/// fixture's `add` function, with the fixture source account. Companion to
+/// [`fixture_host_function`] for the transaction-envelope entry point.
+pub fn fixture_transaction_envelope() -> Result<TransactionEnvelope> {
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: fixture_host_function()?,
+            auth: VecM::default(),
+        }),
+    };
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(FIXTURE_SOURCE_ACCOUNT)),
+        fee: 100,
+        seq_num: SequenceNumber(1),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into()?,
+        ext: TransactionExt::V0,
+    };
+    Ok(TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    }))
+}
+
 pub fn fixture_contract_address() -> ScAddress {
     ScAddress::Contract(ContractId(Hash(FIXTURE_CONTRACT_ID)))
 }
@@ -217,6 +377,175 @@ pub fn fixture_contract_instance_entry() -> Result<LedgerEntry> {
             }),
         },
     )))
+}
+
+// ---------------------------------------------------------------------------
+// Generic entry / key constructors for the three-state integration tests.
+//
+// Every `*_entry` here is a **Present** entry; wrap it in a
+// `LedgerEntryWithLiveUntil` with a real `Some(live_until)` (ContractData /
+// ContractCode entries abort the host with (Storage, InternalError) if the TTL
+// is `None`). The matching `*_key` helpers compute the `LedgerKey` used to
+// probe the snapshot (identical to `ledger_entry_to_ledger_key` on the entry).
+// ---------------------------------------------------------------------------
+
+/// The `ScAddress` for a contract id.
+pub fn contract_address(id: [u8; 32]) -> ScAddress {
+    ScAddress::Contract(ContractId(Hash(id)))
+}
+
+/// A Present `ContractCode` entry embedding `wasm` (hash = sha256(wasm)).
+pub fn contract_code_entry(wasm: &[u8]) -> Result<LedgerEntry> {
+    Ok(ledger_entry(LedgerEntryData::ContractCode(
+        ContractCodeEntry {
+            ext: ContractCodeEntryExt::V0,
+            hash: Hash(wasm_hash(wasm)),
+            code: wasm.try_into()?,
+        },
+    )))
+}
+
+/// The `LedgerKey` for the `ContractCode` entry of `wasm`.
+pub fn contract_code_key(wasm: &[u8]) -> LedgerKey {
+    LedgerKey::ContractCode(LedgerKeyContractCode {
+        hash: Hash(wasm_hash(wasm)),
+    })
+}
+
+/// A Present contract-instance `ContractData` entry (durability Persistent).
+///
+/// `instance_storage` populates the instance-storage map read by
+/// `env.storage().instance()`; pass `None` for an empty instance.
+pub fn contract_instance_entry(
+    id: [u8; 32],
+    wasm: &[u8],
+    instance_storage: Option<ScMap>,
+) -> Result<LedgerEntry> {
+    Ok(ledger_entry(LedgerEntryData::ContractData(
+        ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract_address(id),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+            val: ScVal::ContractInstance(ScContractInstance {
+                executable: ContractExecutable::Wasm(Hash(wasm_hash(wasm))),
+                storage: instance_storage,
+            }),
+        },
+    )))
+}
+
+/// The `LedgerKey` for a contract's instance `ContractData` entry.
+pub fn contract_instance_key(id: [u8; 32]) -> LedgerKey {
+    LedgerKey::ContractData(LedgerKeyContractData {
+        contract: contract_address(id),
+        key: ScVal::LedgerKeyContractInstance,
+        durability: ContractDataDurability::Persistent,
+    })
+}
+
+/// A Present `ContractData` entry with an explicit key / durability / value.
+pub fn contract_data_entry(
+    id: [u8; 32],
+    key: ScVal,
+    durability: ContractDataDurability,
+    val: ScVal,
+) -> LedgerEntry {
+    ledger_entry(LedgerEntryData::ContractData(ContractDataEntry {
+        ext: ExtensionPoint::V0,
+        contract: contract_address(id),
+        key,
+        durability,
+        val,
+    }))
+}
+
+/// The `LedgerKey` for a `ContractData` entry.
+pub fn contract_data_key(id: [u8; 32], key: ScVal, durability: ContractDataDurability) -> LedgerKey {
+    LedgerKey::ContractData(LedgerKeyContractData {
+        contract: contract_address(id),
+        key,
+        durability,
+    })
+}
+
+/// A Present `Account` entry for the given ed25519 public key bytes.
+pub fn account_entry(bytes: [u8; 32]) -> LedgerEntry {
+    ledger_entry(LedgerEntryData::Account(AccountEntry {
+        account_id: account_id(bytes),
+        balance: 10_000_000_000,
+        seq_num: SequenceNumber(0),
+        num_sub_entries: 0,
+        inflation_dest: None,
+        flags: 0,
+        home_domain: String32::default(),
+        thresholds: Thresholds([1, 0, 0, 0]),
+        signers: VecM::default(),
+        ext: AccountEntryExt::V0,
+    }))
+}
+
+/// The `LedgerKey` for an `Account` entry.
+pub fn account_key(bytes: [u8; 32]) -> LedgerKey {
+    LedgerKey::Account(LedgerKeyAccount {
+        account_id: account_id(bytes),
+    })
+}
+
+/// Build a single-entry instance-storage `ScMap` mapping a `symbol_short!` key
+/// (e.g. `"INST"`) to a `u32` value, matching the `storage` fixture's
+/// `set_instance` / `get_instance`.
+pub fn instance_storage_u32(symbol: &str, val: u32) -> Result<ScMap> {
+    let entry = ScMapEntry {
+        key: ScVal::Symbol(ScSymbol(symbol.try_into()?)),
+        val: ScVal::U32(val),
+    };
+    Ok(ScMap(vec![entry].try_into()?))
+}
+
+/// `HostFunction` invoking `storage`'s `function_name` with `args`.
+pub fn storage_host_function(function_name: &str, args: Vec<ScVal>) -> Result<HostFunction> {
+    Ok(HostFunction::InvokeContract(InvokeContractArgs {
+        contract_address: contract_address(STORAGE_CONTRACT_ID),
+        function_name: function_name.as_bytes().to_vec().try_into()?,
+        args: VecM::try_from(args)?,
+    }))
+}
+
+/// `HostFunction` invoking `caller.call_add(callee, a, b)`.
+pub fn caller_host_function(callee_id: [u8; 32], a: i32, b: i32) -> Result<HostFunction> {
+    Ok(HostFunction::InvokeContract(InvokeContractArgs {
+        contract_address: contract_address(CALLER_CONTRACT_ID),
+        function_name: b"call_add".to_vec().try_into()?,
+        args: VecM::try_from(vec![
+            ScVal::Address(contract_address(callee_id)),
+            ScVal::I32(a),
+            ScVal::I32(b),
+        ])?,
+    }))
+}
+
+/// Assemble a [`SimulationRequest`] over the fixture ledger info / network
+/// config / source account, with caller-supplied entries and policy. This is
+/// the "complete snapshot for a given host_function" builder used across the
+/// three-state integration tests.
+pub fn integration_request(
+    host_function: HostFunction,
+    ledger_entries: Vec<LedgerEntryWithLiveUntil>,
+    absent_keys: Vec<LedgerKey>,
+    unmapped_policy: UnmappedPolicy,
+) -> SimulationRequest {
+    SimulationRequest {
+        host_function,
+        source_account: account_id(FIXTURE_SOURCE_ACCOUNT),
+        ledger_info: fixture_ledger_info(),
+        network_config: NetworkConfigSource::Explicit(fixture_network_config()),
+        ledger_entries,
+        absent_keys,
+        unmapped_policy,
+        base_prng_seed: FIXTURE_PRNG_SEED,
+        enable_diagnostics: true,
+    }
 }
 
 pub fn ledger_entry_to_ledger_key(entry: &LedgerEntry) -> Result<LedgerKey> {
@@ -359,6 +688,74 @@ mod tests {
         assert_eq!(first, second);
         let digest: [u8; 32] = Sha256::digest(&first).into();
         assert_eq!(digest.len(), 32);
+    }
+
+    #[test]
+    fn simulate_transaction_matches_host_function_path() {
+        // Complete fixture snapshot, Explicit config — same inputs the
+        // host-function fixture_request path uses.
+        let ledger_info = fixture_ledger_info();
+        let live_until = Some(ledger_info.sequence_number + 1_000);
+        let ledger_entries = vec![
+            LedgerEntryWithLiveUntil {
+                entry: fixture_contract_code_entry().unwrap(),
+                live_until_ledger: live_until,
+            },
+            LedgerEntryWithLiveUntil {
+                entry: fixture_contract_instance_entry().unwrap(),
+                live_until_ledger: live_until,
+            },
+        ];
+
+        let outcome = simulate_transaction(
+            fixture_transaction_envelope().unwrap(),
+            fixture_ledger_info(),
+            NetworkConfigSource::Explicit(fixture_network_config()),
+            ledger_entries,
+            vec![],
+            UnmappedPolicy::Absent,
+            FIXTURE_PRNG_SEED,
+            true,
+        )
+        .unwrap();
+
+        let tx_bytes = match outcome {
+            SimOutcome::Complete(bytes) => bytes,
+            SimOutcome::NeedsState(keys) => {
+                panic!("tx simulation unexpectedly needs {} entries", keys.len())
+            }
+        };
+
+        // Asserts the returned ScVal is I32(42).
+        let result_xdr = first_result_xdr(&tx_bytes).unwrap();
+        let value = ScVal::from_xdr(result_xdr, Limits::none()).unwrap();
+        assert_eq!(value, ScVal::I32(FIXTURE_SUM));
+
+        // Byte-for-byte identical to the equivalent host-function fixture run.
+        let hf_bytes = match simulate(fixture_request().unwrap()).unwrap() {
+            SimOutcome::Complete(bytes) => bytes,
+            SimOutcome::NeedsState(_) => panic!("host-function fixture needs state"),
+        };
+        assert_eq!(tx_bytes, hf_bytes);
+    }
+
+    #[test]
+    fn extract_rejects_tx_without_invoke_host_function() {
+        // A v0 envelope has no InvokeHostFunction op path.
+        use soroban_env_host::xdr::{TransactionV0Envelope, TransactionV0, TransactionV0Ext};
+        let env = TransactionEnvelope::TxV0(TransactionV0Envelope {
+            tx: TransactionV0 {
+                source_account_ed25519: Uint256(FIXTURE_SOURCE_ACCOUNT),
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                time_bounds: None,
+                memo: Memo::None,
+                operations: VecM::default(),
+                ext: TransactionV0Ext::V0,
+            },
+            signatures: VecM::default(),
+        });
+        assert!(extract_invoke_host_function(&env).is_err());
     }
 
     fn first_result_xdr(output: &[u8]) -> Result<Vec<u8>> {

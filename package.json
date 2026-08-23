@@ -6,14 +6,16 @@
   "packageManager": "pnpm@11.11.0",
   "scripts": {
     "build:fixture-contract": "cargo build --manifest-path fixtures/contracts/add-i32/Cargo.toml --target wasm32v1-none --profile contract && cp fixtures/contracts/add-i32/target/wasm32v1-none/contract/soroban_sim_fixture_add_i32.wasm fixtures/contracts/add_i32.wasm",
+    "build:fixture-contracts": "cargo build --manifest-path fixtures/contracts/add-i32/Cargo.toml --target wasm32v1-none --profile contract && cp fixtures/contracts/add-i32/target/wasm32v1-none/contract/soroban_sim_fixture_add_i32.wasm fixtures/contracts/add_i32.wasm && cargo build --manifest-path fixtures/contracts/storage/Cargo.toml --target wasm32v1-none --profile contract && cp fixtures/contracts/storage/target/wasm32v1-none/contract/soroban_sim_fixture_storage.wasm fixtures/contracts/storage.wasm && cargo build --manifest-path fixtures/contracts/caller/Cargo.toml --target wasm32v1-none --profile contract && cp fixtures/contracts/caller/target/wasm32v1-none/contract/soroban_sim_fixture_caller.wasm fixtures/contracts/caller.wasm",
     "build:component": "cargo build -p soroban-sim-component --target wasm32-wasip2 --release",
     "build:jco": "pnpm exec jco transpile target/wasm32-wasip2/release/soroban_sim_component.wasm -o packages/soroban-sim/src/generated --name soroban-sim-component --no-nodejs-compat",
     "test:native": "cargo test -p soroban-sim-core",
     "test:component": "cargo test -p soroban-sim-component",
     "test:wasmtime": "node scripts/wasmtime-fixture.mjs",
+    "capture:parity": "node scripts/capture-parity-fixture.mjs",
     "check:ts": "pnpm --filter @theahaco/soroban-sim-web-demo check",
     "test:browser": "pnpm --filter @theahaco/soroban-sim-web-demo test",
-    "m0": "pnpm run build:fixture-contract && pnpm run test:native && pnpm run build:component && pnpm run build:jco && pnpm run test:wasmtime && pnpm run check:ts && pnpm run test:browser"
+    "m0": "pnpm run build:fixture-contracts && pnpm run test:native && pnpm run build:component && pnpm run build:jco && pnpm run test:wasmtime && pnpm run check:ts && pnpm run test:browser"
   },
   "devDependencies": {
     "@bytecodealliance/jco": "^1.30.0"

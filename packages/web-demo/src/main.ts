@@ -18,6 +18,9 @@ worker.onmessage = (event: MessageEvent) => {
     null,
     2,
   );
+  // Hard-cancel path: terminating the Worker is the only way to stop a
+  // synchronous component run mid-flight. The SorobanSimulator's AbortSignal
+  // only interrupts async provider round-trips; a wasm hang needs terminate().
   worker.terminate();
 };
 worker.onerror = (event) => {
