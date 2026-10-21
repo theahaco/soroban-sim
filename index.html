@@ -8,8 +8,8 @@
       name="description"
       content="Simulate a Stellar smart-contract transaction locally in your browser before submitting it, using a saved snapshot or current Testnet ledger state."
     />
-    <script type="module" crossorigin src="/soroban-sim/assets/index-C-XjIci-.js"></script>
-    <link rel="stylesheet" crossorigin href="/soroban-sim/assets/index-x1lj75zp.css">
+    <script type="module" crossorigin src="/soroban-sim/assets/index-C2j7TO25.js"></script>
+    <link rel="stylesheet" crossorigin href="/soroban-sim/assets/index-BR8n-kTS.css">
   </head>
   <body>
     <!-- Hidden CI anchor: the run-fixture Worker path writes JSON here and sets
@@ -789,6 +789,131 @@
         </div>
       </section>
 
+      <!-- NETWORK SESSION -->
+      <section class="session" id="session" aria-labelledby="session-h">
+        <div class="ws-head">
+          <span class="eyebrow" id="session-h">Network session</span>
+          <span class="sub"
+            >rehearse a whole sequence of signed transactions on a fork of Testnet or
+            Mainnet — every signature verified, fees charged, nothing ever submitted</span
+          >
+        </div>
+
+        <div class="session-grid">
+          <section class="panel session-fork" aria-labelledby="session-fork-h">
+            <div class="panel-head">
+              <span class="eyebrow" id="session-fork-h">Fork</span>
+              <span class="sub" id="session-state">no session open</span>
+            </div>
+            <div class="field compact-field">
+              <label for="session-network">Network</label>
+              <select id="session-network" class="text-input">
+                <option value="testnet">Testnet</option>
+                <option value="mainnet">Mainnet</option>
+                <option value="custom">Custom RPC URL</option>
+              </select>
+              <input
+                id="session-rpc-url"
+                class="text-input session-rpc-url"
+                type="url"
+                spellcheck="false"
+                placeholder="https://… (read only: getLedgerEntries)"
+                hidden
+              />
+              <p class="field-help">
+                The fork reads the real network lazily, read-only. Transactions apply
+                only in this browser; the log and every entry read are kept in
+                IndexedDB, so a reload resumes the session.
+              </p>
+              <button class="load-contract" id="session-start" type="button" disabled>
+                Fork at the latest ledger
+              </button>
+            </div>
+            <div class="session-saved" id="session-saved"></div>
+            <div class="session-progress" id="session-progress" hidden></div>
+            <p class="up-err" id="session-err" hidden></p>
+          </section>
+
+          <section class="panel session-open" id="session-open" hidden aria-labelledby="session-open-h">
+            <div class="panel-head">
+              <span class="eyebrow" id="session-open-h">Open session</span>
+              <span class="network-pill" id="session-pill">fork</span>
+            </div>
+            <dl class="session-facts">
+              <div><dt>Fork point</dt><dd id="session-fork-point">—</dd></div>
+              <div><dt>Next ledger</dt><dd id="session-next">—</dd></div>
+              <div>
+                <dt>Virtual RPC</dt>
+                <dd><code id="session-rpc">—</code></dd>
+              </div>
+              <div>
+                <dt>Throwaway signer</dt>
+                <dd><code id="session-payer">—</code></dd>
+              </div>
+            </dl>
+            <p class="session-mainnet-warning" id="session-mainnet-warning" hidden>
+              This fork keeps the <b>Mainnet</b> passphrase, so its signatures are real
+              ones. Sign with throwaway keys only: an envelope a real wallet signs here
+              is valid on Mainnet, and anyone who sees it can submit it there.
+            </p>
+            <div class="session-actions">
+              <label class="session-inline">
+                <input id="session-advance-n" type="number" min="1" value="1" aria-label="Ledgers to close" />
+                <button id="session-advance" type="button">close ledgers</button>
+              </label>
+              <button id="session-snapshot" type="button">snapshot</button>
+              <label class="session-inline">
+                <select id="session-snapshots" aria-label="Snapshot to revert to"></select>
+                <button id="session-revert" type="button" disabled>revert</button>
+              </label>
+            </div>
+            <details class="session-envelope">
+              <summary>Submit a signed envelope</summary>
+              <textarea
+                id="session-envelope"
+                class="xdr-input"
+                spellcheck="false"
+                placeholder="base64 TransactionEnvelope, signed"
+                aria-label="Signed transaction envelope"
+              ></textarea>
+              <button class="load-contract" id="session-envelope-submit" type="button">
+                Submit into the session
+              </button>
+            </details>
+            <div class="session-plan">
+              <label class="load-contract" for="session-plan-file">Import a plan (YAML or JSON, with its Wasm files)</label>
+              <input id="session-plan-file" type="file" accept=".yaml,.yml,.json,.wasm" multiple hidden />
+              <p class="field-help" id="session-plan-status">
+                A <code>soroban-sim session</code> plan runs here through the virtual RPC
+                with stellar-sdk: classic signers, throwaway keys by label.
+              </p>
+            </div>
+            <button class="identity-link" id="session-close" type="button">close session</button>
+          </section>
+        </div>
+
+        <section class="panel session-timeline" id="session-timeline" hidden aria-labelledby="session-tl-h">
+          <div class="panel-head">
+            <span class="eyebrow" id="session-tl-h">Step timeline</span>
+            <span class="sub" id="session-step-count">—</span>
+          </div>
+          <ol class="session-steps" id="session-steps"></ol>
+        </section>
+
+        <section class="panel session-report" id="session-report" hidden aria-labelledby="session-report-h">
+          <div class="panel-head">
+            <span class="eyebrow" id="session-report-h">Report</span>
+            <span class="sub" id="session-verdict">—</span>
+          </div>
+          <div class="session-report-actions">
+            <button id="session-report-md" type="button">download Markdown</button>
+            <button id="session-report-json" type="button">download JSON</button>
+          </div>
+          <div class="session-replayable" id="session-replayable" hidden></div>
+          <div class="session-report-body" id="session-report-body"></div>
+        </section>
+      </section>
+
       <footer class="footer">
         <span class="live-dot"></span>
         Simulation runs in a Web Worker — the UI thread only renders progress.
@@ -801,9 +926,17 @@
           <span class="eyebrow" id="submit-dialog-h">Review Testnet submission</span>
           <button class="dialog-close" value="cancel" aria-label="Close review">×</button>
         </div>
-        <p class="submit-warning">
+        <p class="submit-warning" id="submit-warning">
           Local simulation is finished. The next action can open a wallet and broadcast a real Testnet transaction.
         </p>
+        <div class="submit-target" id="submit-target" role="group" aria-label="Where to submit" hidden>
+          <label><input type="radio" name="submit-target" value="session" checked /> Into the open network session (virtual RPC; nothing leaves this browser)</label>
+          <label><input type="radio" name="submit-target" value="testnet" /> To Testnet (real broadcast; the fee payer must be a wallet account on Testnet)</label>
+        </div>
+        <div class="replay-warning" id="replay-warning" hidden>
+          <b>Replay risk.</b> <span id="replay-warning-text"></span>
+          <label><input type="checkbox" id="replay-ack" /> I understand: this signature is valid on the real network.</label>
+        </div>
         <dl class="submit-review">
           <div><dt>Contract call</dt><dd id="review-call">—</dd></div>
           <div><dt>Fee payer</dt><dd id="review-source">—</dd></div>
