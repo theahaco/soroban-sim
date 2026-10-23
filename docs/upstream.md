@@ -4,7 +4,8 @@
 
 The live Testnet workbench pins:
 
-- `rs-soroban-env` tag `v29.0.2`
+- `soroban-sim-host = 29.0.2` (exact-apply host: an isolated copy of upstream
+  `soroban-env-host` 29.0.2; [releases](releases.md) owns the mapping)
 - `soroban-env-host = 29.0.2`
 - `soroban-simulation = 29.0.2`
 - `stellar-xdr = 28.0.0` through upstream crates
