@@ -2,9 +2,60 @@ name: ci
 
 on:
   push:
+    branches: ['**']
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
+  release-inputs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python scripts/sync-package-assets.py --check
+      - run: python scripts/check-upstream-host.py
+      - run: python scripts/test-release-tools.py
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: actionlint
+      - run: actionlint
+
+  packages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: wasm32-wasip2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: packages
+      - run: python scripts/check-packages.py
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo check --workspace --locked
+      - run: cargo check -p soroban-sim-component --target wasm32-wasip2 --locked
+
+  binaries:
+    uses: ./.github/workflows/build-cli.yml
+
   milestone-0:
     runs-on: macos-latest
     steps:

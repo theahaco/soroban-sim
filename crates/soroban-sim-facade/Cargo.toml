@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-publish = false
+readme = "README.md"
 description = "A Stellar RPC facade over a network session, without a transport: stellar-rpc and fork_* JSON-RPC methods, the step log and the session report"
 
 [dependencies]
@@ -17,7 +17,7 @@ sha2.workspace = true
 soroban-env-host = { workspace = true, features = ["recording_mode"] }
 # Default features off so the browser component can leave out exact apply;
 # the CLI turns it on through its own dependency.
-soroban-sim-core = { path = "../soroban-sim-core", default-features = false }
+soroban-sim-core = { path = "../soroban-sim-core", version = "0.1.0", default-features = false }
 soroban-simulation.workspace = true
 # The XDR crate soroban-env-host links, with serde for the report's ScVal
 # JSON and base64 for RPC's XDR strings.

@@ -14,7 +14,7 @@ use std::path::Path;
 fn perch_nido_bootstrap_on_a_mainnet_fork() {
     let wasm = std::env::var("SOROBAN_SIM_BOOTSTRAP_WASM").expect("SOROBAN_SIM_BOOTSTRAP_WASM: a directory with the release Wasm");
     let report = Runner::new(RunConfig {
-        plan_path: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/session/perch-nido-bootstrap.yaml"),
+        plan_path: Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/session/perch-nido-bootstrap.yaml"),
         base: Some(base_from_name("mainnet", None).unwrap()),
         fork_mode: ForkMode::Head,
         wasm_dirs: vec![wasm.into()],

@@ -5,6 +5,23 @@ Portable Soroban simulation spike for browsers, WASI Preview 2 components, and n
 Target repository: `theahaco/soroban-sim`  
 Intended npm package: `@theahaco/soroban-sim`
 
+## Installation and releases
+
+The native CLI package is `soroban-sim-cli`; its executable is `soroban-sim`.
+Once the first release is published:
+
+```sh
+cargo install soroban-sim-cli --locked
+cargo binstall soroban-sim-cli # prebuilt platform archive
+soroban-sim --help
+```
+
+The Rust libraries are `soroban-sim-core`, `soroban-sim-facade` and
+`soroban-sim-component`. `soroban-sim-host` is the isolated upstream application
+host used for exact native metering. Rust 1.89+ is required for the locked
+dependency graph. See [Publishing and release maintenance](docs/releases.md)
+for first-release setup, package verification and recovery.
+
 ## Architecture
 
 Soroban Sim puts the WebAssembly Component Model around the simulator, not around each Soroban contract:

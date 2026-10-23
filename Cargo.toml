@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/soroban-sim-host",
     "crates/soroban-sim-core",
     "crates/soroban-sim-component",
     "crates/soroban-sim-cli",
@@ -12,7 +13,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/theahaco/soroban-sim"
-rust-version = "1.84"
+rust-version = "1.89"
 
 [workspace.dependencies]
 anyhow = "1.0.103"
@@ -25,12 +26,10 @@ sha2 = "0.10.9"
 # ledger snapshot it resolves; upgrade these together when the network moves.
 soroban-env-host = { version = "=29.0.2", default-features = true }
 soroban-simulation = { version = "=29.0.2" }
-# The same host release again, for the network session's applier only: taken
-# from its git tag so that Cargo builds it as a separate crate, without the
-# `recording_mode` feature simulation turns on above. A recording-mode build
-# meters an extra storage-map lookup on every write, so a transaction applied
-# with it uses slightly more CPU than stellar-core's host charges for it.
-soroban-env-host-apply = { package = "soroban-env-host", git = "https://github.com/stellar/rs-soroban-env", tag = "v29.0.2" }
+# Separate package identity keeps recording_mode out of transaction application.
+# Its source is byte-for-byte upstream 29.0.2; see the compatibility package's
+# UPSTREAM.json and docs/releases.md for verification and upgrade instructions.
+soroban-env-host-apply = { package = "soroban-sim-host", path = "crates/soroban-sim-host", version = "=29.0.2" }
 static_assertions = "1.1.0"
 stellar-strkey = "0.0.13"
 wit-bindgen = "0.60.0"

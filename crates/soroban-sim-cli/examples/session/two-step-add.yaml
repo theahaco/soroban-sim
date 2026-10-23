@@ -1,0 +1,37 @@
+# Two dependent steps on a fork of testnet: the deploy needs the code the
+# upload put on the ledger, and the call needs the instance the deploy made.
+# The first step is the negative control: deploying before the upload fails.
+#
+#   soroban-sim session run examples/session/two-step-add.yaml
+#   (or in the web demo: fork Testnet, then import this plan together with
+#    fixtures/contracts/add_i32.wasm)
+name: two-step add_i32
+description: Upload the add_i32 fixture contract, deploy it, call it.
+network: testnet
+
+options:
+  source: "${key.deployer}"
+
+keys:
+  deployer: ed25519
+
+vars:
+  code: c288faf9a72cc930ea5b78963bf012eadf56d1e1f53a18c05adcff663afe29d3
+  add: { contract_id: { deployer: "${key.deployer}", salt: { sha256: add } } }
+
+setup:
+  - label: deployer (a throwaway account the rehearsal funds)
+    fund: { account: "${key.deployer}", xlm: 1000 }
+
+steps:
+  - name: deploy before the upload fails
+    deploy: { deployer: "${key.deployer}", salt: { sha256: add }, wasm_hash: "${code}" }
+    expect: { fails: true }
+  - name: upload add_i32
+    upload: { file: ../../fixtures/contracts/add_i32.wasm, hash: "${code}" }
+  - name: deploy add_i32
+    deploy: { deployer: "${key.deployer}", salt: { sha256: add }, wasm_hash: "${code}" }
+    expect: { equals: "${add}" }
+  - name: add(40, 2)
+    invoke: { contract: "${add}", fn: add, args: [{ i32: 40 }, { i32: 2 }] }
+    expect: { equals: "42" }

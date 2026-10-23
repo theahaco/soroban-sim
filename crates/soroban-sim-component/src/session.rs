@@ -208,7 +208,7 @@ mod tests {
 
     /// Real testnet settings, keyed by LedgerKey XDR.
     fn settings() -> Vec<(Vec<u8>, Vec<u8>)> {
-        let json: serde_json::Value = serde_json::from_str(include_str!("../../../fixtures/parity/native-sac-transfer.json")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(include_str!("../fixtures/parity/native-sac-transfer.json")).unwrap();
         json["snapshot"]
             .as_array()
             .unwrap()

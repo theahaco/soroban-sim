@@ -1,0 +1,57 @@
+name: Release-plz
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-plz
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >-
+      github.repository == 'theahaco/soroban-sim' &&
+      vars.RELEASE_ENABLED == 'true' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
+          persist-credentials: false
+      - name: Require the tested commit to still be main
+        env:
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          test "$(git rev-parse origin/main)" = "$TESTED_SHA"
+          git switch -C main "$TESTED_SHA"
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - name: Publish packages and create their tags and releases
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Prepare the next release PR
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

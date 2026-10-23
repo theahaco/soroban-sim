@@ -29,7 +29,7 @@ pub fn real_key(label: &str) -> Ed25519Key {
 }
 
 pub fn config_entries() -> Vec<StoredEntry> {
-    let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/parity/native-sac-transfer.json")).unwrap();
+    let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/parity/native-sac-transfer.json")).unwrap();
     let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
     json["snapshot"]
         .as_array()
@@ -96,7 +96,7 @@ pub fn rehearse_alice(s: &Session) -> Ed25519Key {
 }
 
 pub fn wasm(name: &str) -> Vec<u8> {
-    std::fs::read(format!("{}/../../fixtures/contracts/{name}.wasm", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    std::fs::read(format!("{}/fixtures/contracts/{name}.wasm", env!("CARGO_MANIFEST_DIR"))).unwrap()
 }
 
 pub fn invoke(contract: &ScAddress, function: &str, args: Vec<ScVal>) -> HostFunction {

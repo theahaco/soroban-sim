@@ -1,0 +1,275 @@
+# The Stellar Registry bootstrap for Perch and Nido on mainnet, as one
+# rehearsal session over forked mainnet state (issue #23's acceptance
+# scenario). Nothing is sent; every real signer is replaced by a throwaway key.
+#
+#   soroban-sim session run examples/session/perch-nido-bootstrap.yaml \
+#     --wasm-dir path/to/release-wasm --differential
+#
+# The release Wasm is found by hash: in --wasm-dir (any file whose name holds
+# the hash), else read from testnet by hash (`bytes_source`). The design-A
+# `perch-account` Wasm (a88dc881…) is not on any network yet, so it must be in
+# a --wasm-dir. `--var topup_xlm=N` changes the assumed top-up of the root
+# manager (the real balance is not enough for the whole sequence).
+name: Perch/Nido mainnet bootstrap
+description: >
+  Two sub-registries from the registry root, the stateless registry and the
+  constructorless deployer, the tier-0 seed, two smart-account authors with an
+  External ed25519 admin, their name bindings, a CAP-71 CI release, and the
+  negative controls: a non-signer envelope, a replay, a wrong-key smart-account
+  signature, a fresh fork without the session's deploys, and an expired
+  ci-publish rule.
+
+network: mainnet
+
+options:
+  source: "${theahaco}"
+  bytes_source: testnet
+
+keys:
+  theahaco: ed25519          # stands in for the root manager's real key
+  admin: { ed25519: author-admin }
+  ci: { ed25519: ci-delegate }
+  not_a_signer: ed25519
+  mallory: ed25519
+
+vars:
+  topup_xlm: 500
+  theahaco: GAMPJROHOAW662FINQ4XQOY2ULX5IEGYXCI4SMZYE75EHQBR6PSTJG3M
+  root: { contract_id: { deployer: "${theahaco}", salt: { sha256: "2026-04-24T13:41:00" } } }
+  perch: { contract_id: { deployer: "${root}", salt: { sha256: perch } } }
+  nido: { contract_id: { deployer: "${root}", salt: { sha256: nido } } }
+  constructorless: { contract_id: { deployer: "${perch}", salt: { sha256: constructorless } } }
+  perch_author: { contract_id: { deployer: "${theahaco}", salt: { sha256: perch-author } } }
+  nido_author: { contract_id: { deployer: "${theahaco}", salt: { sha256: nido-author } } }
+  registry_version: { view: { contract: "${root}", fn: current_version, args: [{ string: registry }] } }
+
+  stateless_hash: 4b2d9ea4148474715076e81067cff06b765248d9c4cd7d0e99e53df3e368adec
+  account_hash: a88dc881918388b8c862ec3aa2525cc44b3fabadcc9a90ee3d49e93b4005d218
+  compiler_hash: 960b2ce788303ac7d7b41dd0a338268b72bb225b69e54fdcfb86788566a0fcb3
+  interpreter_hash: cf652205e7d99ed0959467e6bd9c3a712138e95f0fb8f1bd25168514dc0f4d5b
+  spending_limit_hash: 4b9ff1756be41f9cda2276bb8d1d34f02ee13c32648631345f1f50660cc27b18
+  verifier_hash: 97f5c4c006e3002a3f6e021a31faf8ad3cdd4656251a6d84f3f3ba82529e1658
+  # deploy_stateless puts each tier-0 contract at its content address.
+  compiler: { contract_id: { deployer: "${constructorless}", salt: "${compiler_hash}" } }
+  interpreter: { contract_id: { deployer: "${constructorless}", salt: "${interpreter_hash}" } }
+  spending_limit: { contract_id: { deployer: "${constructorless}", salt: "${spending_limit_hash}" } }
+  verifier: { contract_id: { deployer: "${constructorless}", salt: "${verifier_hash}" } }
+
+signers:
+  "${theahaco}": { classic: [theahaco] }
+
+setup:
+  - label: theahaco (root manager)
+    substitute_master_key: { account: "${theahaco}", key: theahaco }
+  - label: theahaco (assumed top-up before the run)
+    fund: { account: "${theahaco}", xlm: "${topup_xlm}" }
+  - label: author admin key's G account (pays apply_doc)
+    fund: { account: "${key.admin}", xlm: 50 }
+  - label: CI delegate's G account (pays CI publishes)
+    fund: { account: "${key.ci}", xlm: 20 }
+
+steps:
+  - name: the derived ids bootstrap.sh asserts
+    assert:
+      - { value: "${perch}", equals: CCDXWLV66FRSOAUNDIUWLWFONIQJ7DGG3IFJP76FP6RJYEGIHA56A4HO }
+      - { value: "${constructorless}", equals: CC236AK2RX7MUO7BV7JYDDW5KHZ3X7YYJOJKCVDC543BQBNNSUCZB7NN }
+  - name: "preflight: the root's manager"
+    view: { contract: "${root}", fn: manager }
+    expect: { equals: "${theahaco}" }
+
+  # --- create-registry perch, create-registry nido -------------------------
+  - name: "create-registry perch: root.deploy(registry)"
+    invoke:
+      contract: "${root}"
+      fn: deploy
+      args:
+        - { string: registry }
+        - { string: "${registry_version}" }
+        - { string: perch }
+        - { address: "${theahaco}" }
+        - { vec: [{ address: "${theahaco}" }, { address: "${theahaco}" }, { address: "${root}" }] }
+        - void
+    expect: { equals: "${perch}" }
+  - name: "create-registry nido: root.deploy(registry)"
+    invoke:
+      contract: "${root}"
+      fn: deploy
+      args:
+        - { string: registry }
+        - { string: "${registry_version}" }
+        - { string: nido }
+        - { address: "${theahaco}" }
+        - { vec: [{ address: "${theahaco}" }, { address: "${theahaco}" }, { address: "${root}" }] }
+        - void
+    expect: { equals: "${nido}" }
+
+  # --- all: code ------------------------------------------------------------
+  - name: "code: upload perch-stateless-registry"
+    upload: { hash: "${stateless_hash}" }
+  - name: "code: upload perch-account (design A)"
+    upload: { hash: "${account_hash}" }
+
+  # --- all: publish-stateless, constructorless -------------------------------
+  - name: "publish-stateless: perch.publish_hash"
+    invoke:
+      contract: "${perch}"
+      fn: publish_hash
+      args: [{ string: perch-stateless-registry }, { address: "${perch_author}" }, { bytes: "${stateless_hash}" }, { string: "0.1.0" }]
+  - name: perch.fetch_hash(perch-stateless-registry, 0.1.0)
+    view: { contract: "${perch}", fn: fetch_hash, args: [{ string: perch-stateless-registry }, { string: "0.1.0" }] }
+    expect: { equals: "${stateless_hash}" }
+  - name: "constructorless: perch.deploy"
+    invoke:
+      contract: "${perch}"
+      fn: deploy
+      args:
+        - { string: perch-stateless-registry }
+        - { string: "0.1.0" }
+        - { string: constructorless }
+        - { address: "${theahaco}" }
+        - { vec: [{ address: "${theahaco}" }, { address: "${theahaco}" }, { address: "${root}" }] }
+        - void
+    expect: { equals: "${constructorless}" }
+
+  # --- all: seed tier-0 -------------------------------------------------------
+  - { name: "seed: upload perch-doc-compiler", upload: { hash: "${compiler_hash}" } }
+  - { name: "seed: upload perch-interpreter", upload: { hash: "${interpreter_hash}" } }
+  - { name: "seed: upload perch-spending-limit", upload: { hash: "${spending_limit_hash}" } }
+  - { name: "seed: upload perch-ed25519-verifier", upload: { hash: "${verifier_hash}" } }
+  - name: "seed: publish_hash perch-doc-compiler 0.3.3"
+    invoke: { contract: "${constructorless}", fn: publish_hash, args: [{ string: perch-doc-compiler }, { address: "${perch_author}" }, { bytes: "${compiler_hash}" }, { string: "0.3.3" }] }
+  - name: "seed: deploy_stateless perch-doc-compiler"
+    invoke: { contract: "${constructorless}", fn: deploy_stateless, args: [{ string: perch-doc-compiler }, { string: "0.3.3" }, void] }
+    expect: { equals: "${compiler}" }
+  - name: "seed: publish_hash perch-interpreter 0.1.4"
+    invoke: { contract: "${constructorless}", fn: publish_hash, args: [{ string: perch-interpreter }, { address: "${perch_author}" }, { bytes: "${interpreter_hash}" }, { string: "0.1.4" }] }
+  - name: "seed: deploy_stateless perch-interpreter"
+    invoke: { contract: "${constructorless}", fn: deploy_stateless, args: [{ string: perch-interpreter }, { string: "0.1.4" }, void] }
+    expect: { equals: "${interpreter}" }
+  - name: "seed: publish_hash perch-spending-limit 0.1.3"
+    invoke: { contract: "${constructorless}", fn: publish_hash, args: [{ string: perch-spending-limit }, { address: "${perch_author}" }, { bytes: "${spending_limit_hash}" }, { string: "0.1.3" }] }
+  - name: "seed: deploy_stateless perch-spending-limit"
+    invoke: { contract: "${constructorless}", fn: deploy_stateless, args: [{ string: perch-spending-limit }, { string: "0.1.3" }, void] }
+    expect: { equals: "${spending_limit}" }
+  - name: "seed: publish_hash perch-ed25519-verifier 10.0.1"
+    invoke: { contract: "${constructorless}", fn: publish_hash, args: [{ string: perch-ed25519-verifier }, { address: "${perch_author}" }, { bytes: "${verifier_hash}" }, { string: "10.0.1" }] }
+  - name: "seed: deploy_stateless perch-ed25519-verifier"
+    invoke: { contract: "${constructorless}", fn: deploy_stateless, args: [{ string: perch-ed25519-verifier }, { string: "10.0.1" }, void] }
+    expect: { equals: "${verifier}" }
+
+  # --- all: authors and name bindings ----------------------------------------
+  - name: the ci-publish rule's not-after-ledger
+    set: { expiry: { ledger_plus: 40 } }
+
+  - name: "create-author perch: deploy perch-account with External(verifier, admin)"
+    deploy:
+      deployer: "${theahaco}"
+      salt: { sha256: perch-author }
+      wasm_hash: "${account_hash}"
+      args: [{ vec: [{ vec: [{ symbol: External }, { address: "${verifier}" }, { bytes: "${key.admin.pk}" }] }] }]
+    expect: { equals: "${perch_author}" }
+  - name: perch author's revision
+    view: { contract: "${perch_author}", fn: revision }
+    save: perch_revision
+  - name: "create-author perch: apply_doc (External ed25519 admin, addr_oz_v1)"
+    invoke:
+      contract: "${perch_author}"
+      fn: apply_doc
+      args:
+        - bytes_utf8: '{"version":1,"network":"${network.passphrase}","signers":[{"id":"admin","verifier":"${verifier}","key":"${key.admin.pk}"},{"id":"ci","address":"${key.ci}"}],"rules":[{"name":"admin","scope":{"type":"self-admin"},"principals":{"type":"all","signers":["admin"]}},{"name":"ci-publish","scope":{"type":"contract","address":"${constructorless}"},"principals":{"type":"all","signers":["ci"]},"functions":["publish","publish_hash"],"args":[{"index":1,"pred":{"type":"is-self"}}],"not-after-ledger":${expiry}},{"name":"admin-registry","scope":{"type":"contract","address":"${constructorless}"},"principals":{"type":"all","signers":["admin"]}}]}'
+        - { u32: 0 }
+        - { u64: "${perch_revision}" }
+    source: "${key.admin}"
+    auth:
+      "${perch_author}":
+        oz: { digest: addr_oz_v1, rule: { name: admin }, signers: [{ external: { verifier: "${verifier}", key: admin } }] }
+  - name: perch author has 3 rules
+    view: { contract: "${perch_author}", fn: get_context_rules_count }
+    expect: { equals: "3" }
+  - name: "names perch: perch-webauthn-verifier @ 0.0.0"
+    invoke: { contract: "${constructorless}", fn: publish_hash, args: [{ string: perch-webauthn-verifier }, { address: "${perch_author}" }, { bytes_sha256: "perch-bootstrap:perch-webauthn-verifier" }, { string: "0.0.0" }] }
+  - name: "names perch: perch-zk-pool @ 0.0.0"
+    invoke: { contract: "${constructorless}", fn: publish_hash, args: [{ string: perch-zk-pool }, { address: "${perch_author}" }, { bytes_sha256: "perch-bootstrap:perch-zk-pool" }, { string: "0.0.0" }] }
+  - name: "names perch: perch-zk-adapter @ 0.0.0"
+    invoke: { contract: "${constructorless}", fn: publish_hash, args: [{ string: perch-zk-adapter }, { address: "${perch_author}" }, { bytes_sha256: "perch-bootstrap:perch-zk-adapter" }, { string: "0.0.0" }] }
+  - name: "names perch: perch-recovery @ 0.0.0"
+    invoke: { contract: "${constructorless}", fn: publish_hash, args: [{ string: perch-recovery }, { address: "${perch_author}" }, { bytes_sha256: "perch-bootstrap:perch-recovery" }, { string: "0.0.0" }] }
+  - name: "names perch: perch-account-factory @ 0.0.0"
+    invoke: { contract: "${constructorless}", fn: publish_hash, args: [{ string: perch-account-factory }, { address: "${perch_author}" }, { bytes_sha256: "perch-bootstrap:perch-account-factory" }, { string: "0.0.0" }] }
+
+  - name: "create-author nido: deploy perch-account with External(verifier, admin)"
+    deploy:
+      deployer: "${theahaco}"
+      salt: { sha256: nido-author }
+      wasm_hash: "${account_hash}"
+      args: [{ vec: [{ vec: [{ symbol: External }, { address: "${verifier}" }, { bytes: "${key.admin.pk}" }] }] }]
+    expect: { equals: "${nido_author}" }
+  - name: nido author's revision
+    view: { contract: "${nido_author}", fn: revision }
+    save: nido_revision
+  - name: "create-author nido: apply_doc (External ed25519 admin, addr_oz_v1)"
+    invoke:
+      contract: "${nido_author}"
+      fn: apply_doc
+      args:
+        - bytes_utf8: '{"version":1,"network":"${network.passphrase}","signers":[{"id":"admin","verifier":"${verifier}","key":"${key.admin.pk}"},{"id":"ci","address":"${key.ci}"}],"rules":[{"name":"admin","scope":{"type":"self-admin"},"principals":{"type":"all","signers":["admin"]}},{"name":"ci-publish","scope":{"type":"contract","address":"${nido}"},"principals":{"type":"all","signers":["ci"]},"functions":["publish","publish_hash"],"args":[{"index":1,"pred":{"type":"is-self"}}],"not-after-ledger":${expiry}},{"name":"admin-registry","scope":{"type":"contract","address":"${nido}"},"principals":{"type":"all","signers":["admin"]}}]}'
+        - { u32: 0 }
+        - { u64: "${nido_revision}" }
+    source: "${key.admin}"
+    auth:
+      "${nido_author}":
+        oz: { digest: addr_oz_v1, rule: { name: admin }, signers: [{ external: { verifier: "${verifier}", key: admin } }] }
+  - name: nido author has 3 rules
+    view: { contract: "${nido_author}", fn: get_context_rules_count }
+    expect: { equals: "3" }
+  - name: "names nido: nido-factory @ 0.0.0"
+    invoke: { contract: "${nido}", fn: publish_hash, args: [{ string: nido-factory }, { address: "${nido_author}" }, { bytes_sha256: "perch-bootstrap:nido-factory" }, { string: "0.0.0" }] }
+  - name: "names nido: nido-name-registry @ 0.0.0"
+    invoke: { contract: "${nido}", fn: publish_hash, args: [{ string: nido-name-registry }, { address: "${nido_author}" }, { bytes_sha256: "perch-bootstrap:nido-name-registry" }, { string: "0.0.0" }] }
+
+  # --- later: a CI release through ci-publish (CAP-71 delegate) --------------
+  - name: "ci: publish_hash perch-doc-compiler 0.3.4"
+    invoke: { contract: "${constructorless}", fn: publish_hash, args: [{ string: perch-doc-compiler }, { address: "${perch_author}" }, { bytes_sha256: "rehearsal: 0.3.4 bytes" }, { string: "0.3.4" }] }
+    source: "${key.ci}"
+    auth: &ci_publish
+      "${perch_author}":
+        oz: { digest: addr_oz_v1, rule: { name: ci-publish }, signers: [{ delegated: { account: "${key.ci}", keys: [ci] } }] }
+
+  # --- negative controls (each must fail) ---------------------------------
+  - name: "negative: envelope signed by a non-signer"
+    invoke: { contract: "${constructorless}", fn: publish_hash, args: [{ string: neg-test }, { address: "${perch_author}" }, { bytes: "0707070707070707070707070707070707070707070707070707070707070707" }, { string: "0.0.1" }] }
+    sign_with: [not_a_signer]
+    expect: { fails: txBAD_AUTH }
+  - name: "negative (control): the same call, correctly signed"
+    invoke: { contract: "${constructorless}", fn: publish_hash, args: [{ string: neg-test }, { address: "${perch_author}" }, { bytes: "0707070707070707070707070707070707070707070707070707070707070707" }, { string: "0.0.1" }] }
+    save_envelope: control
+  - name: "negative: replay of that envelope"
+    envelope: "${control}"
+    expect: { fails: txBAD_SEQ }
+  - name: "negative: smart-account signature by a non-signer"
+    invoke: { contract: "${constructorless}", fn: publish_hash, args: [{ string: perch-doc-compiler }, { address: "${perch_author}" }, { bytes: "0808080808080808080808080808080808080808080808080808080808080808" }, { string: "0.3.9" }] }
+    source: "${key.admin}"
+    auth:
+      "${perch_author}":
+        oz: { digest: addr_oz_v1, rule: { name: admin-registry }, signers: [{ external: { verifier: "${verifier}", key: mallory } }] }
+    expect: { fails: Auth }
+  - name: "negative: on a fresh fork, perch does not exist"
+    view: { contract: "${perch}", fn: fetch_hash, args: [{ string: perch-stateless-registry }, { string: "0.1.0" }] }
+    fresh_fork: true
+    expect: { fails: MissingValue }
+
+  # --- time travel past ci-publish's not-after-ledger ------------------------
+  - name: "ci: pre-sign the 0.3.5 publish while the rule is live"
+    invoke: { contract: "${constructorless}", fn: publish_hash, args: [{ string: perch-doc-compiler }, { address: "${perch_author}" }, { bytes_sha256: "rehearsal: 0.3.5 bytes" }, { string: "0.3.5" }] }
+    source: "${key.ci}"
+    auth: *ci_publish
+    auth_expiration_ledgers: 200
+    hold: true
+    save_envelope: presigned
+  - name: close ledgers to the rule's last ledger
+    advance: { to_ledger: "${expiry}" }
+  - name: and one more
+    advance: { ledgers: 1 }
+  - name: "negative: the pre-signed publish, submitted after expiry"
+    envelope: "${presigned}"
+    expect: { fails: "3002" }

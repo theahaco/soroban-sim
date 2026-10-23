@@ -25,7 +25,7 @@ const FORK_LEDGER: u32 = 10_000_000;
 const FORK_TIME: u64 = 1_800_000_000;
 
 fn repo() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
 fn scratch(name: &str) -> PathBuf {

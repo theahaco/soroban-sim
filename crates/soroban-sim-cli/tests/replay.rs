@@ -9,7 +9,7 @@ use soroban_sim_cli::replay::{run, FidelityReport, FixtureInfo, ReplayFixture};
 use std::path::PathBuf;
 
 fn fixtures() -> Vec<(PathBuf, ReplayFixture)> {
-    let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/replay"));
+    let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/replay"));
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.to_string_lossy().ends_with(".json.gz")).collect();
     paths.sort();
     paths.into_iter().map(|p| (p.clone(), ReplayFixture::load(&p).unwrap())).collect()

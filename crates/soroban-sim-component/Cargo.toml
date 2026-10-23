@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-publish = false
+readme = "README.md"
+
+description = "WASI component interface for portable Soroban simulation"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -17,6 +19,6 @@ serde_json = "1.0"
 soroban-env-host = { workspace = true, features = ["recording_mode"] }
 # The browser applies session transactions with the recording-mode host it
 # already links, so it skips the second, exact-metering host build.
-soroban-sim-core = { path = "../soroban-sim-core", default-features = false }
-soroban-sim-facade = { path = "../soroban-sim-facade" }
+soroban-sim-core = { path = "../soroban-sim-core", version = "0.1.0", default-features = false }
+soroban-sim-facade = { path = "../soroban-sim-facade", version = "0.1.0" }
 wit-bindgen.workspace = true

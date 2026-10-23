@@ -35,7 +35,7 @@ fn alice() -> AccountId {
 /// The "network": real testnet settings plus alice, whose real key the
 /// tests hold.
 fn network() -> BTreeMap<LedgerKey, StoredEntry> {
-    let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/parity/native-sac-transfer.json")).unwrap();
+    let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/parity/native-sac-transfer.json")).unwrap();
     let json: Value = serde_json::from_str(&raw).unwrap();
     let mut entries: Vec<StoredEntry> = json["snapshot"]
         .as_array()
@@ -170,7 +170,7 @@ fn provide(base: &DeferredBase, network: &BTreeMap<LedgerKey, StoredEntry>, keys
 }
 
 fn wasm(name: &str) -> Vec<u8> {
-    std::fs::read(format!("{}/../../fixtures/contracts/{name}.wasm", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    std::fs::read(format!("{}/fixtures/contracts/{name}.wasm", env!("CARGO_MANIFEST_DIR"))).unwrap()
 }
 
 fn sha256(b: &[u8]) -> [u8; 32] {

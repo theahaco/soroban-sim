@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-publish = false
+readme = "README.md"
+
+description = "Portable Soroban simulation and forked network sessions"
 
 [dependencies]
 anyhow.workspace = true

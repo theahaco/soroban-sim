@@ -1,0 +1,7 @@
+# Keep the unchanged compatibility host distinct from maintained release code.
+crates/soroban-sim-host/src/** linguist-vendored -whitespace
+crates/soroban-sim-host/build.rs linguist-vendored -whitespace
+# Package copies are generated from the repository's authoring sources.
+crates/soroban-sim-*/fixtures/** linguist-generated
+crates/soroban-sim-cli/examples/session/** linguist-generated
+crates/soroban-sim-component/wit/** linguist-generated

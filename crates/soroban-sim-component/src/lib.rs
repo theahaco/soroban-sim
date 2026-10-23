@@ -1,5 +1,5 @@
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "wit",
     world: "simulator",
 });
 
@@ -213,7 +213,7 @@ mod tests {
     /// ConfigSetting entries `NetworkConfigSource::FromLedgerEntries` needs).
     fn parity_request() -> Request {
         let json: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../fixtures/parity/local-add-i32.json"
+            "../fixtures/parity/local-add-i32.json"
         ))
         .unwrap();
         let tx = TransactionEnvelope::from_xdr(b64(json["txXdr"].as_str().unwrap()), Limits::none())

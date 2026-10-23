@@ -1,0 +1,1147 @@
+use core::cmp::{min, Ordering};
+use std::rc::Rc;
+
+use crate::{
+    budget::AsBudget,
+    err,
+    host::{
+        mem_helper::MemFnArgs,
+        metered_clone::{self, MeteredAlloc, MeteredClone, MeteredContainer},
+    },
+    host_object::{ExecutableTag, HostMap},
+    storage::{InstanceStorageMap, Storage},
+    vm::VersionedContractCodeCostInputs,
+    xdr::{
+        AccountEntry, AccountId, Asset, BytesM, ContractCodeEntry, ContractCostType,
+        ContractDataDurability, ContractDataEntry, ContractExecutable,
+        ContractExecutableExternalRef, ContractId, ContractIdPreimage, ExtensionPoint, Hash,
+        HashIdPreimage, HashIdPreimageContractId, LedgerEntry, LedgerEntryData, LedgerEntryExt,
+        LedgerKey, LedgerKeyAccount, LedgerKeyContractCode, LedgerKeyContractData,
+        LedgerKeyTrustLine, PublicKey, ScAddress, ScContractInstance, ScErrorCode, ScErrorType,
+        ScMap, ScVal, Signer, SignerKey, ThresholdIndexes, TrustLineAsset, Uint256,
+    },
+    AddressObject, BytesObject, Compare, Env, EnvBase, ErrorHandler, ExecutableTagObject, Host,
+    HostError, MapObject, StorageType, Symbol, Tag, TryFromVal, U32Val, Val, VmCaller, Void,
+};
+
+impl Host {
+    pub(crate) fn with_mut_storage<F, U>(&self, f: F) -> Result<U, HostError>
+    where
+        F: FnOnce(&mut Storage) -> Result<U, HostError>,
+    {
+        f(&mut *self.try_borrow_storage_mut()?)
+    }
+
+    /// Immutable accessor to the instance storage of the currently running
+    /// contract.
+    /// Performs lazy initialization of instance storage on access.
+    pub(crate) fn with_instance_storage<F, U>(&self, f: F) -> Result<U, HostError>
+    where
+        F: FnOnce(&InstanceStorageMap) -> Result<U, HostError>,
+    {
+        self.with_current_context_mut(|ctx| {
+            self.maybe_init_instance_storage(ctx)?;
+            f(ctx.storage.as_ref().ok_or_else(|| {
+                self.err(
+                    ScErrorType::Context,
+                    ScErrorCode::InternalError,
+                    "missing instance storage",
+                    &[],
+                )
+            })?)
+        })
+    }
+
+    /// Mutable accessor to the instance storage of the currently running
+    /// contract.
+    /// Performs lazy initialization of instance storage on access.
+    pub(crate) fn with_mut_instance_storage<F, U>(&self, f: F) -> Result<U, HostError>
+    where
+        F: FnOnce(&mut InstanceStorageMap) -> Result<U, HostError>,
+    {
+        self.with_current_context_mut(|ctx| {
+            self.maybe_init_instance_storage(ctx)?;
+            let storage = ctx.storage.as_mut().ok_or_else(|| {
+                self.err(
+                    ScErrorType::Context,
+                    ScErrorCode::InternalError,
+                    "missing instance storage",
+                    &[],
+                )
+            })?;
+            // Consider any mutable access to be modifying the instance storage.
+            // This way we would provide consistent footprint (RO for read-only
+            // ops using `with_instance_storage` and RW for potentially
+            // mutating ops using `with_mut_instance_storage`).
+            storage.is_modified = true;
+            f(storage)
+        })
+    }
+
+    pub(crate) fn contract_instance_ledger_key(
+        &self,
+        contract_id: &ContractId,
+    ) -> Result<Rc<LedgerKey>, HostError> {
+        let contract_id = contract_id.metered_clone(self)?;
+        Rc::metered_new(
+            LedgerKey::ContractData(LedgerKeyContractData {
+                key: ScVal::LedgerKeyContractInstance,
+                durability: ContractDataDurability::Persistent,
+                contract: ScAddress::Contract(contract_id),
+            }),
+            self,
+        )
+    }
+
+    pub(crate) fn extract_contract_instance_from_ledger_entry(
+        &self,
+        entry: &LedgerEntry,
+    ) -> Result<ScContractInstance, HostError> {
+        match &entry.data {
+            LedgerEntryData::ContractData(e) => match &e.val {
+                ScVal::ContractInstance(instance) => instance.metered_clone(self),
+                _ => Err(self.err(
+                    ScErrorType::Storage,
+                    ScErrorCode::InternalError,
+                    "ledger entry for contract instance does not contain contract instance",
+                    &[],
+                )),
+            },
+            _ => Err(self.err(
+                ScErrorType::Storage,
+                ScErrorCode::InternalError,
+                "expected ContractData ledger entry",
+                &[],
+            )),
+        }
+    }
+
+    // Notes on metering: retrieving from storage covered. Rest are free.
+    pub(crate) fn retrieve_contract_instance_from_storage(
+        &self,
+        key: &Rc<LedgerKey>,
+    ) -> Result<ScContractInstance, HostError> {
+        let entry = self.try_borrow_storage_mut()?.get(key, self, None)?;
+        self.extract_contract_instance_from_ledger_entry(&entry)
+    }
+
+    pub(crate) fn contract_code_ledger_key(
+        &self,
+        wasm_hash: &Hash,
+    ) -> Result<Rc<LedgerKey>, HostError> {
+        let wasm_hash = wasm_hash.metered_clone(self)?;
+        Rc::metered_new(
+            LedgerKey::ContractCode(LedgerKeyContractCode { hash: wasm_hash }),
+            self,
+        )
+    }
+
+    pub(crate) fn retrieve_wasm_from_storage(
+        &self,
+        wasm_hash: &Hash,
+    ) -> Result<(BytesM, VersionedContractCodeCostInputs), HostError> {
+        let key = self.contract_code_ledger_key(wasm_hash)?;
+        match &self.try_borrow_storage_mut()?.get(&key, self, None)?.data {
+            LedgerEntryData::ContractCode(e) => {
+                let code = e.code.metered_clone(self)?;
+                let costs = match &e.ext {
+                    crate::xdr::ContractCodeEntryExt::V0 => VersionedContractCodeCostInputs::V0 {
+                        wasm_bytes: code.len(),
+                    },
+                    crate::xdr::ContractCodeEntryExt::V1(v1) => {
+                        VersionedContractCodeCostInputs::V1(
+                            v1.cost_inputs.metered_clone(self.as_budget())?,
+                        )
+                    }
+                };
+                Ok((code, costs))
+            }
+            _ => Err(err!(
+                self,
+                (ScErrorType::Storage, ScErrorCode::InternalError),
+                "expected ContractCode ledger entry",
+                *wasm_hash
+            )),
+        }
+    }
+
+    pub(crate) fn verify_wasm_exists(&self, wasm_hash: &Hash) -> Result<(), HostError> {
+        let key = self.contract_code_ledger_key(wasm_hash)?;
+        let exists = self.try_borrow_storage_mut()?.has(&key, self, None)?;
+        if !exists {
+            return Err(err!(
+                self,
+                (ScErrorType::Storage, ScErrorCode::MissingValue),
+                "Wasm does not exist",
+                wasm_hash
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn executable_ref_from_inputs(
+        &self,
+        executable_owner: AddressObject,
+        tag: ExecutableTagObject,
+    ) -> Result<ContractExecutableExternalRef, HostError> {
+        let executable_owner = self.visit_obj(executable_owner, |addr: &ScAddress| {
+            addr.metered_clone(self)
+        })?;
+        let tag = self.visit_obj(tag, |t: &ExecutableTag| t.0.metered_clone(self))?;
+        Ok(ContractExecutableExternalRef {
+            executable_owner,
+            tag,
+        })
+    }
+
+    pub(crate) fn executable_ref_ledger_key(
+        &self,
+        executable_ref: &ContractExecutableExternalRef,
+    ) -> Result<Rc<LedgerKey>, HostError> {
+        Rc::metered_new(
+            LedgerKey::ContractData(LedgerKeyContractData {
+                contract: executable_ref.executable_owner.metered_clone(self)?,
+                key: ScVal::ExecutableTag(executable_ref.tag.metered_clone(self)?),
+                durability: ContractDataDurability::Persistent,
+            }),
+            self,
+        )
+    }
+
+    pub(crate) fn verify_executable_ref_entry_exists(
+        &self,
+        external_ref: &ContractExecutableExternalRef,
+        tag: Option<ExecutableTagObject>,
+    ) -> Result<(), HostError> {
+        let key = self.executable_ref_ledger_key(&external_ref)?;
+        let exists = self
+            .try_borrow_storage_mut()?
+            .has(&key, self, tag.map(|t| t.to_val()))?;
+        if !exists {
+            return Err(err!(
+                self,
+                (ScErrorType::Storage, ScErrorCode::MissingValue),
+                "executable reference entry does not exist",
+                &external_ref.executable_owner,
+                &external_ref.tag
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resolve_external_ref_wasm_hash(
+        &self,
+        external_ref: &ContractExecutableExternalRef,
+    ) -> Result<Hash, HostError> {
+        let key = self.executable_ref_ledger_key(&external_ref)?;
+        let entry = self.try_borrow_storage_mut()?.get(&key, self, None)?;
+        match &entry.data {
+            LedgerEntryData::ContractData(e) => match &e.val {
+                ScVal::Bytes(bytes) => self.fixed_length_bytes_from_slice::<Hash, 32>(
+                    "executable_ref_wasm_hash",
+                    bytes.as_slice(),
+                ),
+                _ => Err(self.err(
+                    ScErrorType::Storage,
+                    ScErrorCode::InternalError,
+                    "executable reference entry does not contain a Wasm hash",
+                    &[],
+                )),
+            },
+            _ => Err(self.err(
+                ScErrorType::Storage,
+                ScErrorCode::InternalError,
+                "expected ContractData ledger entry for executable reference",
+                &[],
+            )),
+        }
+    }
+
+    // Stores the contract instance specified with its parts (executable and
+    // storage).
+    // When either of parts is `None`, the old value is preserved (when
+    // existent).
+    // `executable` has to be present for newly created contract instances.
+    // Notes on metering: `from_host_obj` and `put` to storage covered, rest are free.
+    pub(crate) fn store_contract_instance(
+        &self,
+        executable: Option<ContractExecutable>,
+        instance_storage: Option<ScMap>,
+        contract_id: ContractId,
+        key: &Rc<LedgerKey>,
+    ) -> Result<(), HostError> {
+        if self.try_borrow_storage_mut()?.has(key, self, None)? {
+            let (current, live_until_ledger) = self
+                .try_borrow_storage_mut()?
+                .get_with_live_until_ledger(key, self, None)?;
+            let mut current = (*current).metered_clone(self)?;
+
+            if let LedgerEntryData::ContractData(ref mut entry) = current.data {
+                if let ScVal::ContractInstance(ref mut instance) = entry.val {
+                    if let Some(executable) = executable {
+                        instance.executable = executable;
+                    }
+                    if let Some(storage) = instance_storage {
+                        instance.storage = Some(storage);
+                    }
+                } else {
+                    return Err(self.err(
+                        ScErrorType::Storage,
+                        ScErrorCode::InternalError,
+                        "expected ScVal::ContractInstance for contract instance",
+                        &[],
+                    ));
+                }
+            } else {
+                return Err(self.err(
+                    ScErrorType::Storage,
+                    ScErrorCode::InternalError,
+                    "expected DataEntry for contract instance",
+                    &[],
+                ));
+            }
+
+            self.try_borrow_storage_mut()?.put(
+                &key,
+                &Rc::metered_new(current, self)?,
+                live_until_ledger,
+                self,
+                None,
+            )?;
+        } else {
+            let data = ContractDataEntry {
+                contract: ScAddress::Contract(contract_id.metered_clone(self)?),
+                key: ScVal::LedgerKeyContractInstance,
+                val: ScVal::ContractInstance(ScContractInstance {
+                    executable: executable.ok_or_else(|| {
+                        self.err(
+                            ScErrorType::Context,
+                            ScErrorCode::InternalError,
+                            "can't initialize contract without executable",
+                            &[],
+                        )
+                    })?,
+                    storage: instance_storage,
+                }),
+                durability: ContractDataDurability::Persistent,
+                ext: ExtensionPoint::V0,
+            };
+            self.try_borrow_storage_mut()?.put(
+                key,
+                &Host::new_contract_data(self, data)?,
+                Some(self.get_min_live_until_ledger(ContractDataDurability::Persistent)?),
+                self,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn extend_contract_code_ttl_from_contract_id(
+        &self,
+        instance_key: Rc<LedgerKey>,
+        threshold: u32,
+        extend_to: u32,
+    ) -> Result<(), HostError> {
+        match self
+            .retrieve_contract_instance_from_storage(&instance_key)?
+            .executable
+        {
+            ContractExecutable::Wasm(wasm_hash) => {
+                let key = self.contract_code_ledger_key(&wasm_hash)?;
+                self.try_borrow_storage_mut()?
+                    .extend_ttl(self, key, threshold, extend_to, None)?;
+            }
+            ContractExecutable::ExternalRef(external_ref) => {
+                // Extend both the executable reference entry (in the owner
+                // contract's storage) and the referenced Wasm code entry, so
+                // that the contract stays both resolvable and executable.
+                let ref_key = self.executable_ref_ledger_key(&external_ref)?;
+                self.try_borrow_storage_mut()?
+                    .extend_ttl(self, ref_key, threshold, extend_to, None)?;
+                let wasm_hash = self.resolve_external_ref_wasm_hash(&external_ref)?;
+                let code_key = self.contract_code_ledger_key(&wasm_hash)?;
+                self.try_borrow_storage_mut()?
+                    .extend_ttl(self, code_key, threshold, extend_to, None)?;
+            }
+            ContractExecutable::StellarAsset => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn extend_contract_instance_ttl_from_contract_id(
+        &self,
+        instance_key: Rc<LedgerKey>,
+        threshold: u32,
+        extend_to: u32,
+    ) -> Result<(), HostError> {
+        self.try_borrow_storage_mut()?.extend_ttl(
+            self,
+            instance_key.metered_clone(self)?,
+            threshold,
+            extend_to,
+            None,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn extend_contract_code_ttl_v2(
+        &self,
+        instance_key: &Rc<LedgerKey>,
+        extend_to: u32,
+        min_extension: u32,
+        max_extension: u32,
+    ) -> Result<(), HostError> {
+        match self
+            .retrieve_contract_instance_from_storage(instance_key)?
+            .executable
+        {
+            ContractExecutable::Wasm(wasm_hash) => {
+                let key = self.contract_code_ledger_key(&wasm_hash)?;
+                self.try_borrow_storage_mut()?.extend_ttl_v2(
+                    self,
+                    key,
+                    extend_to,
+                    min_extension,
+                    max_extension,
+                    None,
+                )?;
+            }
+            ContractExecutable::ExternalRef(external_ref) => {
+                // The 'code' scope extends both the executable reference entry
+                // and the referenced Wasm code entry for external-ref contracts.
+                let ref_key = self.executable_ref_ledger_key(&external_ref)?;
+                self.try_borrow_storage_mut()?.extend_ttl_v2(
+                    self,
+                    ref_key,
+                    extend_to,
+                    min_extension,
+                    max_extension,
+                    None,
+                )?;
+                let wasm_hash = self.resolve_external_ref_wasm_hash(&external_ref)?;
+                let code_key = self.contract_code_ledger_key(&wasm_hash)?;
+                self.try_borrow_storage_mut()?.extend_ttl_v2(
+                    self,
+                    code_key,
+                    extend_to,
+                    min_extension,
+                    max_extension,
+                    None,
+                )?;
+            }
+            ContractExecutable::StellarAsset => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn extend_contract_instance_ttl_v2(
+        &self,
+        instance_key: Rc<LedgerKey>,
+        extend_to: u32,
+        min_extension: u32,
+        max_extension: u32,
+    ) -> Result<(), HostError> {
+        self.try_borrow_storage_mut()?.extend_ttl_v2(
+            self,
+            instance_key,
+            extend_to,
+            min_extension,
+            max_extension,
+            None,
+        )?;
+        Ok(())
+    }
+
+    // metering: covered by components
+    pub(crate) fn get_full_contract_id_preimage(
+        &self,
+        init_preimage: ContractIdPreimage,
+    ) -> Result<HashIdPreimage, HostError> {
+        Ok(HashIdPreimage::ContractId(HashIdPreimageContractId {
+            network_id: self
+                .hash_from_bytesobj_input("network_id", self.get_ledger_network_id()?)?,
+            contract_id_preimage: init_preimage,
+        }))
+    }
+
+    // notes on metering: `get` from storage is covered. Rest are free.
+    pub(crate) fn load_account(&self, account_id: AccountId) -> Result<AccountEntry, HostError> {
+        let acc = self.to_account_key(account_id)?;
+        self.with_mut_storage(|storage| match &storage.get(&acc, self, None)?.data {
+            LedgerEntryData::Account(ae) => ae.metered_clone(self),
+            e => Err(err!(
+                self,
+                (ScErrorType::Storage, ScErrorCode::InternalError),
+                "ledger entry is not account",
+                e.name()
+            )),
+        })
+    }
+
+    pub(crate) fn to_account_key(&self, account_id: AccountId) -> Result<Rc<LedgerKey>, HostError> {
+        Rc::metered_new(LedgerKey::Account(LedgerKeyAccount { account_id }), self)
+    }
+
+    pub(crate) fn create_asset_4(&self, asset_code: [u8; 4], issuer: AccountId) -> Asset {
+        use crate::xdr::{AlphaNum4, AssetCode4};
+        Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(asset_code),
+            issuer,
+        })
+    }
+
+    pub(crate) fn create_asset_12(&self, asset_code: [u8; 12], issuer: AccountId) -> Asset {
+        use crate::xdr::{AlphaNum12, AssetCode12};
+        Asset::CreditAlphanum12(AlphaNum12 {
+            asset_code: AssetCode12(asset_code),
+            issuer,
+        })
+    }
+
+    pub(crate) fn to_trustline_key(
+        &self,
+        account_id: AccountId,
+        asset: TrustLineAsset,
+    ) -> Result<Rc<LedgerKey>, HostError> {
+        Rc::metered_new(
+            LedgerKey::Trustline(LedgerKeyTrustLine { account_id, asset }),
+            self,
+        )
+    }
+
+    pub(crate) fn get_signer_weight_from_account(
+        &self,
+        target_signer: Uint256,
+        account: &AccountEntry,
+    ) -> Result<u8, HostError> {
+        if account.account_id
+            == AccountId(PublicKey::PublicKeyTypeEd25519(
+                target_signer.metered_clone(self)?,
+            ))
+        {
+            // Target signer is the master key, so return the master weight
+            let Some(threshold) = account
+                .thresholds
+                .0
+                .get(ThresholdIndexes::MasterWeight as usize)
+            else {
+                return Err(self.error(
+                    (ScErrorType::Value, ScErrorCode::InternalError).into(),
+                    "unexpected thresholds-array size",
+                    &[],
+                ));
+            };
+            Ok(*threshold)
+        } else {
+            // Target signer is not the master key, so search the account signers
+            let signers: &Vec<Signer> = account.signers.as_ref();
+            for signer in signers {
+                if let SignerKey::Ed25519(ref this_signer) = signer.key {
+                    if &target_signer == this_signer {
+                        // Clamp the weight at 255. Stellar protocol before v10
+                        // allowed weights to exceed 255, but the max threshold
+                        // is 255, hence there is no point in having a larger
+                        // weight.
+                        let weight = min(signer.weight, u8::MAX as u32);
+                        // We've found the target signer in the account signers, so return the weight
+                        return weight.try_into().map_err(|_| {
+                            self.err(
+                                ScErrorType::Auth,
+                                ScErrorCode::ArithDomain,
+                                "signer weight does not fit in u8",
+                                &[U32Val::from(weight).to_val()],
+                            )
+                        });
+                    }
+                }
+            }
+            // We didn't find the target signer, return 0 weight to indicate that.
+            Ok(0u8)
+        }
+    }
+
+    pub(crate) fn new_contract_data(
+        &self,
+        data: ContractDataEntry,
+    ) -> Result<Rc<LedgerEntry>, HostError> {
+        Rc::metered_new(
+            LedgerEntry {
+                // This is modified to the appropriate value on the core side during
+                // commiting the ledger transaction.
+                last_modified_ledger_seq: 0,
+                data: LedgerEntryData::ContractData(data),
+                ext: LedgerEntryExt::V0,
+            },
+            self,
+        )
+    }
+
+    pub(crate) fn new_contract_code(
+        &self,
+        data: ContractCodeEntry,
+    ) -> Result<Rc<LedgerEntry>, HostError> {
+        Rc::metered_new(
+            LedgerEntry {
+                // This is modified to the appropriate value on the core side during
+                // commiting the ledger transaction.
+                last_modified_ledger_seq: 0,
+                data: LedgerEntryData::ContractCode(data),
+                ext: LedgerEntryExt::V0,
+            },
+            self,
+        )
+    }
+
+    pub(crate) fn modify_ledger_entry_data(
+        &self,
+        original_entry: &LedgerEntry,
+        new_data: LedgerEntryData,
+    ) -> Result<Rc<LedgerEntry>, HostError> {
+        Rc::metered_new(
+            LedgerEntry {
+                // This is modified to the appropriate value on the core side during
+                // commiting the ledger transaction.
+                last_modified_ledger_seq: 0,
+                data: new_data,
+                ext: original_entry.ext.metered_clone(self)?,
+            },
+            self,
+        )
+    }
+
+    pub(crate) fn contract_id_from_scaddress(
+        &self,
+        address: ScAddress,
+    ) -> Result<ContractId, HostError> {
+        match address {
+            ScAddress::Contract(contract_id) => Ok(contract_id),
+            _ => Err(self.err(
+                ScErrorType::Object,
+                ScErrorCode::InvalidInput,
+                "not a contract address",
+                &[],
+            )),
+        }
+    }
+
+    pub(crate) fn contract_id_from_address(
+        &self,
+        address: AddressObject,
+    ) -> Result<ContractId, HostError> {
+        self.visit_obj(address, |addr: &ScAddress| {
+            self.contract_id_from_scaddress(addr.metered_clone(self)?)
+        })
+    }
+
+    pub(crate) fn validate_put_contract_data(
+        &self,
+        k: Val,
+        v: Val,
+        t: StorageType,
+    ) -> Result<(), HostError> {
+        // Executable reference entries must be persistent entries that store
+        // a hash of an existing Wasm.
+        if k.get_tag() == Tag::ExecutableTagObject {
+            if !matches!(t, StorageType::Persistent) {
+                return Err(self.err(
+                    ScErrorType::Storage,
+                    ScErrorCode::InvalidInput,
+                    "executable reference entries may only use persistent storage",
+                    &[],
+                ));
+            }
+            let value_obj: BytesObject = v.try_into().map_err(|_| {
+                self.err(
+                    ScErrorType::Storage,
+                    ScErrorCode::InvalidInput,
+                    "executable reference value must be a 32-byte Wasm hash",
+                    &[v],
+                )
+            })?;
+            let wasm_hash = self.hash_from_bytesobj_input("executable_ref_wasm_hash", value_obj)?;
+            self.verify_wasm_exists(&wasm_hash)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_del_contract_data(
+        &self,
+        k: Val,
+        _t: StorageType,
+    ) -> Result<(), HostError> {
+        // Executable reference entries may never be deleted, so that the
+        // instances based on them remain usable.
+        if k.get_tag() == Tag::ExecutableTagObject {
+            return Err(self.err(
+                ScErrorType::Storage,
+                ScErrorCode::InvalidAction,
+                "executable reference entries cannot be deleted",
+                &[],
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn put_contract_data_into_ledger(
+        &self,
+        k: Val,
+        v: Val,
+        t: StorageType,
+    ) -> Result<(), HostError> {
+        let durability: ContractDataDurability = t.try_into()?;
+        let key = self.storage_key_from_val(k, durability)?;
+        // Currently the storage stores the whole ledger entries, while this
+        // operation might only modify the internal `ScVal` value. Thus we
+        // need to only overwrite the value in case if there is already an
+        // existing ledger entry value for the key in the storage.
+        if self.try_borrow_storage_mut()?.has(&key, self, Some(k))? {
+            let (current, live_until_ledger) = self
+                .try_borrow_storage_mut()?
+                .get_with_live_until_ledger(&key, self, Some(k))?;
+            let mut current = (*current).metered_clone(self)?;
+            match current.data {
+                LedgerEntryData::ContractData(ref mut entry) => {
+                    entry.val = self.from_host_val(v)?;
+                }
+                _ => {
+                    return Err(self.err(
+                        ScErrorType::Storage,
+                        ScErrorCode::InternalError,
+                        "expected DataEntry",
+                        &[],
+                    ));
+                }
+            }
+            self.try_borrow_storage_mut()?.put(
+                &key,
+                &Rc::metered_new(current, self)?,
+                live_until_ledger,
+                self,
+                Some(k),
+            )?;
+        } else {
+            let data = ContractDataEntry {
+                contract: ScAddress::Contract(self.get_current_contract_id_internal()?),
+                key: self.from_host_val(k)?,
+                val: self.from_host_val(v)?,
+                durability,
+                ext: ExtensionPoint::V0,
+            };
+            self.try_borrow_storage_mut()?.put(
+                &key,
+                &Host::new_contract_data(self, data)?,
+                Some(self.get_min_live_until_ledger(durability)?),
+                self,
+                Some(k),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    // Creates a new map from keys and values slices.
+    // If `sparse` is true, void values are excluded from the map.
+    pub(crate) fn map_new_from_slices_impl<K>(
+        &self,
+        keys: &[K],
+        vals: &[Val],
+        sparse: bool,
+    ) -> Result<MapObject, HostError>
+    where
+        Symbol: TryFromVal<Host, K, Error = crate::Error>,
+    {
+        if keys.len() != vals.len() {
+            return Err(self.err(
+                ScErrorType::Object,
+                ScErrorCode::UnexpectedSize,
+                "differing key and value slice lengths when creating map from slices",
+                &[],
+            ));
+        }
+        Vec::<(Val, Val)>::charge_bulk_init_cpy(keys.len() as u64, self)?;
+
+        let mut prev_key = None;
+        let mut map_vec = Vec::<(Val, Val)>::with_capacity(keys.len());
+        for (key_str, val) in keys.iter().zip(vals.iter().copied()) {
+            let key = Symbol::try_from_val(self, key_str)?.to_val();
+            if let Some(prev_key) = prev_key {
+                // There is no need to verify that the keys are in ascending
+                // order for non-sparse case, as that's covered by
+                // `HostMap::from_map_with_host`. We need the comparison for
+                // the sparse case to avoid the cases where the keys are not in
+                // ascending order, but have their values excluded from the map
+                // due to being void (so they wouldn't be passed into
+                // `HostMap::from_map_with_host`).
+                if sparse && self.compare(&prev_key, &key)? != std::cmp::Ordering::Less {
+                    return Err(self.err(
+                        ScErrorType::Object,
+                        ScErrorCode::InvalidInput,
+                        "keys not in ascending order when creating map from slices",
+                        &[],
+                    ));
+                }
+            }
+            prev_key = Some(key);
+
+            self.check_val_integrity(val)?;
+            if !sparse || !val.is_void() {
+                map_vec.push((key, val));
+            }
+        }
+        let map = HostMap::from_map_with_host(map_vec, self)?;
+        self.add_host_object(map)
+    }
+
+    // Creates a new map from key and value slices of length len stored in
+    // linear memory.
+    // If `sparse` is true, void values are excluded from the map.
+    pub(crate) fn map_new_from_linear_memory_impl(
+        &self,
+        vmcaller: &mut VmCaller<Host>,
+        keys_pos: U32Val,
+        vals_pos: U32Val,
+        len: U32Val,
+        sparse: bool,
+    ) -> Result<MapObject, HostError> {
+        // Step 1: extract all key symbols.
+        let MemFnArgs {
+            vm,
+            pos: keys_pos,
+            len,
+        } = self.get_mem_fn_args(keys_pos, len)?;
+        let mut key_syms = Vec::<Symbol>::with_metered_capacity(len as usize, self)?;
+        self.metered_vm_scan_slices_in_linear_memory(
+            vmcaller,
+            &vm,
+            keys_pos,
+            len as usize,
+            |_n, slice| {
+                key_syms.push(Symbol::try_from_val(self, &slice)?);
+                Ok(())
+            },
+        )?;
+
+        // Step 2: extract all val Vals.
+        let vals_pos: u32 = vals_pos.into();
+        Vec::<Val>::charge_bulk_init_cpy(len as u64, self)?;
+        let mut vals: Vec<Val> = vec![Val::VOID.into(); len as usize];
+        // The full slice memcpy is charged twice (2 *):
+        // - charge for conversion from bytes to `Val`s (1x)
+        // - for per-element relative-to-absolute object handle translation (1x)
+        self.charge_budget(
+            ContractCostType::MemCpy,
+            Some((len as u64).saturating_mul(2 * 8)),
+        )?;
+        self.metered_vm_read_vals_from_linear_memory(
+            vmcaller,
+            &vm,
+            vals_pos,
+            vals.as_mut_slice(),
+            |buf| self.relative_to_absolute(Val::from_payload(u64::from_le_bytes(*buf))),
+        )?;
+
+        self.map_new_from_slices_impl(&key_syms, &vals, sparse)
+    }
+
+    /// Copies the values corresponding to the provided keys from the map into
+    /// the provided output `Val`s slice.
+    /// If `sparse` is true, the output slice will contain `Void` for keys that
+    /// are not present in the map, and it's allowed to not exhaust every map
+    /// key. If `sparse` is false, the key slice must match the map key set
+    /// one-to-one.
+    fn map_unpack_impl<K: AsRef<[u8]> + Copy>(
+        &self,
+        map: MapObject,
+        mut keys: impl Iterator<Item = Result<K, HostError>>,
+        vals: &mut [Val],
+        sparse: bool,
+    ) -> Result<(), HostError> {
+        self.visit_obj(map, |host_map: &HostMap| {
+            // Dense map unpacking only supports queries that match the map's
+            // keys one-to-one, so we can short-circuit here.
+            if !sparse && host_map.len() != vals.len() {
+                return Err(self.err(
+                    ScErrorType::Object,
+                    ScErrorCode::UnexpectedSize,
+                    "differing map and output slice lengths when unpacking map",
+                    &[],
+                ));
+            }
+
+            // Bulk charge for writing the values to the output slice.
+            metered_clone::charge_shallow_copy::<Val>(vals.len() as u64, self)?;
+
+            let mut map_iter = host_map.iter(self)?;
+            let mut map_iter_value = map_iter.next();
+            let mut prev_key: Option<K> = None;
+            // Iterate the input keys and find the corresponding value in the
+            // map, if it exists (or else write Void into the corresponding
+            // output value, or return error in non-sparse mode).
+            // Since map keys are sorted and query keys are expected to be
+            // sorted, we can iterate through the map instead of doing key
+            // lookups.
+            for out_val in vals.iter_mut() {
+                let key = keys.next().ok_or_else(|| {
+                    self.err(
+                        ScErrorType::Context,
+                        ScErrorCode::InternalError,
+                        "fewer keys than output values when unpacking map",
+                        &[],
+                    )
+                })??;
+                if let Some(prev_key) = prev_key {
+                    if self
+                        .as_budget()
+                        .compare(&prev_key.as_ref(), &key.as_ref())?
+                        != Ordering::Less
+                    {
+                        return Err(self.err(
+                            ScErrorType::Object,
+                            ScErrorCode::InvalidInput,
+                            "keys are not in ascending order when unpacking map",
+                            &[],
+                        ));
+                    }
+                }
+
+                prev_key = Some(key);
+                *out_val = Val::VOID.into();
+                while let Some((map_key, map_val)) = map_iter_value {
+                    let map_key_symbol = Symbol::try_from_val(self, map_key)?;
+                    let cmp = self.compare_symbol_to_bytes(map_key_symbol, key.as_ref())?;
+                    if sparse {
+                        match cmp {
+                            // Map key is less than the lookup key, need to keep
+                            // iterating map forward.
+                            Ordering::Less => {
+                                map_iter_value = map_iter.next();
+                                continue;
+                            }
+                            // Found a match, write the output value and advance the
+                            // map iterator.
+                            Ordering::Equal => {
+                                *out_val = *map_val;
+                                map_iter_value = map_iter.next();
+                                break;
+                            }
+                            // Map key is greater than the lookup key, so we
+                            // can't find the current key, but need to keep the
+                            // map iterator at the current position for the next
+                            // lookup.
+                            Ordering::Greater => break,
+                        }
+                    } else {
+                        if cmp != Ordering::Equal {
+                            return Err(self.err(
+                                ScErrorType::Object,
+                                ScErrorCode::InvalidInput,
+                                "key not found in map when unpacking map",
+                                &[],
+                            ));
+                        }
+                        *out_val = *map_val;
+                        map_iter_value = map_iter.next();
+                        break;
+                    }
+                }
+            }
+
+            // Iterate through the rest of the map to ensure that all the keys
+            // are Symbols. That's just a sanity check on the off-chance the
+            // user has called this for the wrong map and we happened to exhaust
+            // the keys before exhausting the map.
+            while let Some((map_key, _)) = map_iter_value {
+                let _ = Symbol::try_from_val(self, map_key)?;
+                map_iter_value = map_iter.next();
+            }
+            Ok(())
+        })
+    }
+
+    /// Common implementation of `map_unpack_to_slice` and
+    /// `sparse_map_unpack_to_slice` (distinguished by the `sparse` argument).
+    pub(crate) fn map_unpack_to_slice_impl(
+        &self,
+        map: MapObject,
+        keys: &[&str],
+        vals: &mut [Val],
+        sparse: bool,
+    ) -> Result<Void, HostError> {
+        if keys.len() != vals.len() {
+            return Err(self.err(
+                ScErrorType::Object,
+                ScErrorCode::UnexpectedSize,
+                "differing key and value slice lengths when unpacking map to slice",
+                &[],
+            ));
+        }
+        self.map_unpack_impl(map, keys.iter().map(|k| Ok(*k)), vals, sparse)?;
+        Ok(Val::VOID)
+    }
+
+    /// Common implementation of `map_unpack_to_linear_memory` and
+    /// `sparse_map_unpack_to_linear_memory` (distinguished by the `sparse`
+    /// argument).
+    pub(crate) fn map_unpack_to_linear_memory_impl(
+        &self,
+        vmcaller: &mut VmCaller<Host>,
+        map: MapObject,
+        keys_pos: U32Val,
+        vals_pos: U32Val,
+        len: U32Val,
+        sparse: bool,
+    ) -> Result<Void, HostError> {
+        let MemFnArgs {
+            vm,
+            pos: keys_pos,
+            len,
+        } = self.get_mem_fn_args(keys_pos, len)?;
+
+        let mut out_vals: Vec<Val> = Vec::with_metered_capacity(len as usize, self)?;
+        out_vals.resize(len as usize, Val::VOID.into());
+        {
+            let mem_data = vm.get_memory(self)?.data(vmcaller.try_mut()?);
+            // Charge for scanning `len` key slices from linear memory.
+            metered_clone::charge_shallow_copy::<u64>(len as u64, self)?;
+            self.map_unpack_impl(
+                map,
+                (0..len as usize).map(|i| {
+                    let key_range = self.scan_linear_memory_slice(mem_data, keys_pos, i)?;
+                    mem_data
+                        .get(key_range)
+                        .ok_or_else(|| self.err_oob_linear_memory())
+                }),
+                out_vals.as_mut_slice(),
+                sparse,
+            )?;
+        }
+
+        self.metered_vm_write_vals_to_linear_memory(
+            vmcaller,
+            &vm,
+            vals_pos.into(),
+            out_vals.as_slice(),
+            |v| {
+                Ok(u64::to_le_bytes(
+                    self.absolute_to_relative(*v)?.get_payload(),
+                ))
+            },
+        )?;
+
+        Ok(Val::VOID)
+    }
+}
+
+#[cfg(any(test, feature = "testutils"))]
+use crate::host::ledger_entry::LazyLedgerEntry;
+#[cfg(any(test, feature = "testutils"))]
+use crate::storage::{AccessType, EntryWithLiveUntil};
+
+#[cfg(any(test, feature = "testutils"))]
+impl Host {
+    /// Writes an arbitrary ledger entry to storage.
+    pub fn add_ledger_entry(
+        &self,
+        key: &Rc<LedgerKey>,
+        val: &Rc<LedgerEntry>,
+        live_until_ledger: Option<u32>,
+    ) -> Result<(), HostError> {
+        self.with_mut_storage(|storage| storage.put(key, val, live_until_ledger, self, None))
+    }
+
+    /// Reads an arbitrary ledger entry from the storage.
+    ///
+    /// Returns `None` if the entry does not exist.
+    pub fn get_ledger_entry(
+        &self,
+        key: &Rc<LedgerKey>,
+    ) -> Result<Option<EntryWithLiveUntil>, HostError> {
+        self.with_mut_storage(|storage| storage.try_get_full(key, self, None))
+    }
+
+    /// Returns all the ledger entries stored in the storage as key-value pairs.
+    #[allow(clippy::type_complexity)]
+    pub fn get_stored_entries(
+        &self,
+    ) -> Result<Vec<(Rc<LedgerKey>, Option<EntryWithLiveUntil>)>, HostError> {
+        let budget = self.budget_ref();
+        self.with_mut_storage(|storage| {
+            storage
+                .map
+                .map
+                .iter()
+                .map(|(k, v)| {
+                    let decoded = match v {
+                        Some((e, live_until)) => Some((e.decoded(budget)?, *live_until)),
+                        None => None,
+                    };
+                    Ok((k.clone(), decoded))
+                })
+                .collect()
+        })
+    }
+
+    // Performs the necessary setup to access the provided ledger key/entry in
+    // enforcing storage mode.
+    pub fn setup_storage_entry(
+        &self,
+        key: Rc<LedgerKey>,
+        val: Option<(Rc<LedgerEntry>, Option<u32>)>,
+        access_type: AccessType,
+    ) -> Result<(), HostError> {
+        self.with_mut_storage(|storage| {
+            storage
+                .footprint
+                .record_access(&key, access_type, self.as_budget())?;
+            let val = match val {
+                Some((entry, live_until)) => {
+                    Some((Rc::new(LazyLedgerEntry::from_decoded(entry)), live_until))
+                }
+                None => None,
+            };
+            storage.map = storage.map.insert(key, val, self.as_budget())?;
+            Ok(())
+        })
+    }
+
+    // Performs the necessary setup to access all the entries in provided
+    // footprint in enforcing mode.
+    // "testutils" are not covered by budget metering.
+    #[cfg(test)]
+    pub(crate) fn setup_storage_footprint(
+        &self,
+        footprint: crate::storage::Footprint,
+    ) -> Result<(), HostError> {
+        for (key, access_type) in footprint.0.map {
+            self.setup_storage_entry(key, None, access_type)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_tl_asset_4(
+        &self,
+        asset_code: [u8; 4],
+        issuer: AccountId,
+    ) -> TrustLineAsset {
+        use crate::xdr::{AlphaNum4, AssetCode4};
+        TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(asset_code),
+            issuer,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_tl_asset_12(
+        &self,
+        asset_code: [u8; 12],
+        issuer: AccountId,
+    ) -> TrustLineAsset {
+        use crate::xdr::{AlphaNum12, AssetCode12};
+        TrustLineAsset::CreditAlphanum12(AlphaNum12 {
+            asset_code: AssetCode12(asset_code),
+            issuer,
+        })
+    }
+}

@@ -1,0 +1,103 @@
+name: Build CLI archives
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            tool: cargo
+            smoke: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            tool: cargo
+            smoke: true
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            tool: cross
+            smoke: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04
+            tool: cross
+            smoke: false
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            tool: cargo
+            smoke: true
+          - target: aarch64-apple-darwin
+            os: macos-15
+            tool: cargo
+            smoke: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            tool: cargo
+            smoke: true
+          - target: aarch64-pc-windows-msvc
+            os: windows-2022
+            tool: cargo
+            smoke: false
+          - target: x86_64-unknown-freebsd
+            os: ubuntu-22.04
+            tool: cross
+            smoke: false
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-${{ matrix.target }}
+      - uses: taiki-e/install-action@cross
+        if: matrix.tool == 'cross'
+      - name: Compute and validate the release tag
+        id: version
+        run: python scripts/release-tag.py >> "$GITHUB_OUTPUT"
+      - name: Build archives without publishing
+        id: archive
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: soroban-sim
+          package: soroban-sim-cli
+          target: ${{ matrix.target }}
+          build-tool: ${{ matrix.tool }}
+          locked: true
+          tar: all
+          zip: windows
+          archive: $tag-$target
+          checksum: sha256
+          ref: refs/tags/${{ steps.version.outputs.tag }}
+          dry-run: true
+      - name: Check archive layout, checksums and native execution
+        env:
+          ARCHIVE: ${{ steps.archive.outputs.tar }}
+          ZIP_ARCHIVE: ${{ steps.archive.outputs.zip }}
+          CHECKSUM: ${{ steps.archive.outputs.sha256 }}
+          VERSION: ${{ steps.version.outputs.version }}
+          SMOKE: ${{ matrix.smoke }}
+        run: python scripts/check-cli-archive.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            ${{ steps.archive.outputs.tar }}
+            ${{ steps.archive.outputs.zip }}
+            ${{ steps.archive.outputs.sha256 }}

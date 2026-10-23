@@ -35,13 +35,13 @@ pub const FIXTURE_SOURCE_ACCOUNT: [u8; 32] = [123; 32];
 pub const FIXTURE_NETWORK_ID: [u8; 32] = [5; 32];
 pub const FIXTURE_PRNG_SEED: [u8; 32] = *b"soroban-sim-milestone-0-seed!!!!";
 
-pub const FIXTURE_CONTRACT_WASM: &[u8] = include_bytes!("../../../fixtures/contracts/add_i32.wasm");
+pub const FIXTURE_CONTRACT_WASM: &[u8] = include_bytes!("../fixtures/contracts/add_i32.wasm");
 
 /// The `storage` fixture contract (persistent/temporary/instance storage read+write).
 pub const STORAGE_CONTRACT_WASM: &[u8] =
-    include_bytes!("../../../fixtures/contracts/storage.wasm");
+    include_bytes!("../fixtures/contracts/storage.wasm");
 /// The `caller` fixture contract (cross-contract `invoke_contract`).
-pub const CALLER_CONTRACT_WASM: &[u8] = include_bytes!("../../../fixtures/contracts/caller.wasm");
+pub const CALLER_CONTRACT_WASM: &[u8] = include_bytes!("../fixtures/contracts/caller.wasm");
 
 /// Contract id for the `storage` fixture.
 pub const STORAGE_CONTRACT_ID: [u8; 32] = [11; 32];
