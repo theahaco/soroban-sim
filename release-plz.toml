@@ -6,7 +6,8 @@ changelog_update = true
 dependencies_update = false
 publish_no_verify = false
 
-# The compatibility host tracks the upstream release independently.
+# The compatibility host has its own package version; release-plz may bump it
+# for packaging-only changes. UPSTREAM.json records the upstream source version.
 [[package]]
 name = "soroban-sim-host"
 semver_check = false

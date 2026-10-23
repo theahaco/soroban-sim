@@ -27,8 +27,9 @@ sha2 = "0.10.9"
 soroban-env-host = { version = "=29.0.2", default-features = true }
 soroban-simulation = { version = "=29.0.2" }
 # Separate package identity keeps recording_mode out of transaction application.
-# Its source is byte-for-byte upstream 29.0.2; see the compatibility package's
-# UPSTREAM.json and docs/releases.md for verification and upgrade instructions.
+# The pin is that package's own version. Its source is byte-for-byte the upstream
+# release recorded in its UPSTREAM.json; see docs/releases.md for verification
+# and upgrade instructions.
 soroban-env-host-apply = { package = "soroban-sim-host", path = "crates/soroban-sim-host", version = "=29.0.2" }
 static_assertions = "1.1.0"
 stellar-strkey = "0.0.13"

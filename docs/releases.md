@@ -25,8 +25,8 @@ is disabled until the repository variable `RELEASE_ENABLED` is `true`.
    existing `ci` workflow on current main (or merge the next change) to create
    the first release PR. Review its versions/changelogs and merge it after CI.
 
-The initial versions are 29.0.2 for the compatibility host and 0.1.0 for the
-four Soroban Sim crates. They publish in dependency order: host → core → facade
+The initial versions are 29.0.2 for the compatibility host package and 0.1.0
+for the four Soroban Sim crates. They publish in dependency order: host → core → facade
 → CLI/component. Release-plz can do this first publish using the API token;
 there is no prerequisite manual publication or need to disable verification.
 `release_always = false` prevents the setup merge itself from publishing.
@@ -70,7 +70,8 @@ mainnet/testnet replay sample; it remains below crates.io's package size limit.
 ## Maintaining the isolated host
 
 `soroban-sim-host` has a different Cargo identity from `soroban-env-host`, while
-its `src/` and `build.rs` are copied byte-for-byte from upstream 29.0.2. This
+its `src/` and `build.rs` are copied byte-for-byte from the upstream release
+recorded in `UPSTREAM.json` (currently 29.0.2). This
 keeps the simulator's `recording_mode` feature out of exact transaction
 application. A second dependency alias for the same upstream registry package
 would unify the features and change write metering. Disabling default features
@@ -93,9 +94,20 @@ To upgrade:
 3. Reconcile the normalized upstream production dependencies/features into the
    compatibility manifest; all dependencies must remain registry-resolvable.
    Upstream test/bench targets are not this package's validation suite.
-4. Update its package version and core's exact version pin in the workspace.
-   The host tracks upstream independently; the other four crates share the
-   `sim` version group. Run the package rehearsal and full network replay tests.
+4. Set the package version to a new version and update core's exact pin on it
+   (`soroban-env-host-apply` in the workspace manifest). Matching the upstream
+   version is conventional but not required; the version only has to be newer
+   than any published `soroban-sim-host`. Run the package rehearsal and full
+   network replay tests.
+
+The host package is versioned independently of upstream and of the `sim`
+version group shared by the other four crates. Release-plz keeps automatic
+versioning for it, so a change to its README, license, manifest or
+`UPSTREAM.json` can produce a compatibility release (for example 29.0.3) and
+update core's exact pin. That release still contains the upstream source named
+in `UPSTREAM.json`; a package bump does not imply a new upstream version. The
+upstream mapping is always `UPSTREAM.json`'s `version`, `commit` and
+`crate_sha256`, never the package version.
 
 Prefer removing this compatibility package once an upstream registry release
 supports both modes without feature-dependent application metering. Never
