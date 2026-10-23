@@ -16,8 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ReleaseTools(unittest.TestCase):
-    def invoke(self, script, env):
-        return subprocess.run([sys.executable, str(ROOT / "scripts" / script)], cwd=ROOT,
+    def invoke(self, script, env, *args):
+        return subprocess.run([sys.executable, str(ROOT / "scripts" / script), *args], cwd=ROOT,
                               env=dict(os.environ, **env), text=True, capture_output=True)
 
     def test_manifest_tag_accepts_matching_ref_and_rejects_wrong_version(self):
@@ -28,6 +28,43 @@ class ReleaseTools(unittest.TestCase):
         self.assertEqual(good.returncode, 0, good.stderr)
         bad = self.invoke("release-tag.py", {"GITHUB_REF": "refs/tags/soroban-sim-cli-v999.0.0"})
         self.assertNotEqual(bad.returncode, 0)
+        for ref in ("", "refs/heads/main", "refs/heads/" + tag, "refs/pull/1/merge"):
+            self.assertNotEqual(self.invoke("release-tag.py", {"GITHUB_REF": ref}, "--require-tag").returncode, 0)
+        self.assertEqual(self.invoke("release-tag.py", {"GITHUB_REF": f"refs/tags/{tag}"}, "--require-tag").returncode, 0)
+
+    def test_release_dispatch_targets_only_cli_and_propagates_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            calls = Path(directory) / "calls.jsonl"
+            gh = Path(directory) / "gh"
+            gh.write_text(f'#!{sys.executable}\n' + '''import json, os, sys
+with open(os.environ["GH_CALLS"], "a") as calls:
+    calls.write(json.dumps(sys.argv[1:]) + "\\n")
+sys.exit(int(os.environ.get("GH_EXIT", "0")))
+''')
+            gh.chmod(0o755)
+            env = {"PATH": directory + os.pathsep + os.environ["PATH"], "GH_CALLS": str(calls),
+                   "GITHUB_REPOSITORY": "theahaco/soroban-sim", "RELEASES": ""}
+            library = {"package_name": "soroban-sim-core", "version": "0.1.0", "tag": "soroban-sim-core-v0.1.0"}
+            cli = {"package_name": "soroban-sim-cli", "version": "0.1.0", "tag": "soroban-sim-cli-v0.1.0"}
+            for releases in ("", "[]", json.dumps([library])):
+                env["RELEASES"] = releases
+                result = self.invoke("dispatch-cli-release.py", env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(calls.exists())
+            env["RELEASES"] = json.dumps([library, cli, cli])
+            result = self.invoke("dispatch-cli-release.py", env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual([json.loads(line) for line in calls.read_text().splitlines()], [[
+                "workflow", "run", "cd-soroban-sim.yml", "--repo", "theahaco/soroban-sim",
+                "--ref", "soroban-sim-cli-v0.1.0",
+            ]])
+            calls.unlink()
+            for releases in ("{}", "invalid-json", json.dumps([dict(cli, tag="main")])):
+                env["RELEASES"] = releases
+                self.assertNotEqual(self.invoke("dispatch-cli-release.py", env).returncode, 0)
+                self.assertFalse(calls.exists())
+            env.update(RELEASES=json.dumps([cli]), GH_EXIT="1")
+            self.assertNotEqual(self.invoke("dispatch-cli-release.py", env).returncode, 0)
 
     def archive(self, directory, binary_name="soroban-sim", zip_format=False):
         target = "x86_64-pc-windows-msvc" if zip_format else "x86_64-unknown-linux-gnu"

@@ -1,6 +1,7 @@
 name: Release CLI binaries
 
 on:
+  workflow_dispatch:
   push:
     tags: ['soroban-sim-cli-v*']
 
@@ -12,8 +13,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  validate-tag:
     if: github.repository == 'theahaco/soroban-sim'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - name: Require a CLI tag matching the checked-out manifest
+        run: python3 scripts/release-tag.py --require-tag
+  build:
+    needs: validate-tag
     uses: ./.github/workflows/build-cli.yml
   upload:
     needs: build

@@ -1,9 +1,11 @@
 # Publishing the Rust crates and CLI
 
-The release path follows `stellar-registry/cli`: a release-plz PR controls
-versions and changelogs; merging it publishes crates, tags the tested source
-and creates GitHub releases. The CLI tag starts the binary workflow. Publication
-is disabled until the repository variable `RELEASE_ENABLED` is `true`.
+The release path uses release-plz PRs to control versions and changelogs;
+merging one publishes crates, tags the tested source and creates GitHub
+releases. GitHub operations use the built-in `GITHUB_TOKEN`, with no App ID,
+private key or personal access token. After publication, the release workflow
+explicitly dispatches binary builds at the CLI tag. Publication is disabled
+until the repository variable `RELEASE_ENABLED` is `true`.
 
 ## One-time setup (before enabling publication)
 
@@ -11,10 +13,12 @@ is disabled until the repository variable `RELEASE_ENABLED` is `true`.
    Check availability of `soroban-sim-host`, `soroban-sim-core`,
    `soroban-sim-facade`, `soroban-sim-cli` and `soroban-sim-component`. Names are
    global, not scoped to the GitHub organization.
-2. Install the release GitHub App on `theahaco/soroban-sim`, with Contents and
-   Pull requests write permissions. Set repository secrets `APP_ID` and
-   `APP_PRIVATE_KEY`. The App token lets release PRs trigger checks and CLI tags
-   trigger the binary workflow; the default `GITHUB_TOKEN` cannot do that.
+2. In repository Settings → Actions → General → Workflow permissions, enable
+   **Allow GitHub Actions to create and approve pull requests**. Organization
+   policy must allow this setting. The release job requests Contents, Pull
+   requests and Actions write permissions itself; no GitHub credential secrets
+   are needed. Existing `APP_ID` / `APP_PRIVATE_KEY` secrets are unused by these
+   workflows.
 3. Set `CARGO_REGISTRY_TOKEN` to a token authorized for new publication and
    updates of these names. Never put a token in a committed file or PR body.
 4. Require CI before merging. The `ci` workflow includes native/browser proof,
@@ -23,7 +27,29 @@ is disabled until the repository variable `RELEASE_ENABLED` is `true`.
    out that exact SHA. It refuses a run if main has already advanced.
 5. Set `RELEASE_ENABLED=true` after the preceding settings are ready. Rerun the
    existing `ci` workflow on current main (or merge the next change) to create
-   the first release PR. Review its versions/changelogs and merge it after CI.
+   the first release PR. Follow the approval and review steps below before
+   merging it.
+
+## Reviewing each release PR
+
+When release-plz creates or updates its PR using `GITHUB_TOKEN`, GitHub creates
+the `pull_request` workflow runs with approval required. A maintainer with write
+access must click **Approve workflows to run** in the PR merge box. Do this
+again after an automated update, wait for the required checks to pass on the
+latest revision, then review the versions/changelogs and merge normally.
+This is separate from approving the PR review itself.
+
+Keep the normal required CI checks enabled. Dispatching `ci.yml` manually would
+not satisfy them: GitHub does not evaluate `workflow_dispatch` job checks as
+required PR checks. See GitHub's [workflow triggering rules](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)
+and [required-check restrictions](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks#checks-from-some-workflow-jobs-are-not-evaluated).
+
+The merge must be performed by a maintainer (or automation using a separate
+credential), so it triggers the main push CI that gates publication. Do not
+merge with this repository's workflow `GITHUB_TOKEN`: its push would not start
+main CI.
+
+## First publication and ownership
 
 The initial versions are 29.0.2 for the compatibility host package and 0.1.0
 for the four Soroban Sim crates. They publish in dependency order: host → core → facade
@@ -116,7 +142,7 @@ consumer; the release dependency-graph check rejects that configuration.
 
 ## Binary assets and installation
 
-`build-cli.yml` is reused by CI and the tag release workflow. It builds nine
+`build-cli.yml` is reused by CI and the CLI release workflow. It builds nine
 targets: Linux GNU/musl x86_64 and arm64, macOS x86_64 and arm64, Windows MSVC
 x86_64 and arm64, and FreeBSD x86_64. Native runners also execute `--version`
 and `--help` from the archives. Cross-built Windows arm64, Linux musl arm64
@@ -125,8 +151,12 @@ and FreeBSD archives are layout/checksum checked but not executed in CI.
 The CLI tag is `soroban-sim-cli-v<version>`. Each archive is
 `<tag>-<target>.tar.gz`, plus `.zip` on Windows, with one root-level
 `soroban-sim` or `soroban-sim.exe` file and a SHA-256 checksum asset. The
-manifest's cargo-binstall URL/format templates match this contract. A tag
-whose version disagrees with the manifest is rejected before building.
+manifest's cargo-binstall URL/format templates match this contract. The release
+workflow accepts a tag push or explicit dispatch at a tag. Branch refs and tags
+whose version disagrees with the manifest are rejected before building. Because
+`GITHUB_TOKEN` tag pushes do not start workflows, release-plz's successful
+release output is used to dispatch only the published CLI tag; library-only
+releases do not launch CLI builds.
 
 Archives are uploaded to the GitHub release only after every target has built
 and passed its applicable checks. CI keeps the same archives as Actions
@@ -149,7 +179,18 @@ independently; its Rust source package is included in this pipeline.
 ## Recovery
 
 If a binary build/upload fails, fix infrastructure as needed and rerun that
-tag's workflow. The uploader replaces assets on the same existing release;
+tag's workflow. If the initial dispatch failed (including a partial crate
+publication that already published the CLI), dispatch the existing CLI tag
+explicitly; rerunning release-plz can return no new CLI releases and therefore
+does not guarantee another binary dispatch:
+
+```sh
+gh workflow run cd-soroban-sim.yml --repo theahaco/soroban-sim --ref soroban-sim-cli-v0.1.0
+```
+
+Substitute the actual published tag. `workflow_dispatch` requires the workflow
+to exist on the default branch, so merge this setup PR before enabling release.
+The uploader replaces assets on the same existing release;
 do not move its tag. If published source must change, use a fresh version.
 Crate versions cannot be overwritten. If publication stops part-way through
 the dependency chain, verify which versions reached crates.io, then rerun the
