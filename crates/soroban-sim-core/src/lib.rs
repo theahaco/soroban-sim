@@ -38,8 +38,7 @@ pub const FIXTURE_PRNG_SEED: [u8; 32] = *b"soroban-sim-milestone-0-seed!!!!";
 pub const FIXTURE_CONTRACT_WASM: &[u8] = include_bytes!("../fixtures/contracts/add_i32.wasm");
 
 /// The `storage` fixture contract (persistent/temporary/instance storage read+write).
-pub const STORAGE_CONTRACT_WASM: &[u8] =
-    include_bytes!("../fixtures/contracts/storage.wasm");
+pub const STORAGE_CONTRACT_WASM: &[u8] = include_bytes!("../fixtures/contracts/storage.wasm");
 /// The `caller` fixture contract (cross-contract `invoke_contract`).
 pub const CALLER_CONTRACT_WASM: &[u8] = include_bytes!("../fixtures/contracts/caller.wasm");
 
