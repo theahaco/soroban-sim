@@ -2,8 +2,12 @@
 //! Markdown (for a PR, an issue, or a release checklist).
 
 use serde::Serialize;
-use soroban_env_host::xdr::{ContractDataDurability, LedgerEntry, LedgerEntryData, LedgerKey, ScVal};
-use soroban_sim_core::session::{host_protocol, show_scval, xlm, Session, StoredEntry, TxRecord, TxStatus};
+use soroban_env_host::xdr::{
+    AccountEntry, ContractDataDurability, LedgerEntry, LedgerEntryData, LedgerKey, ScVal, SignerKey, Thresholds, TrustLineAsset,
+};
+use soroban_sim_core::session::{
+    host_protocol, new_account, op_result_name, show_scval, xlm, Session, StoredEntry, TxRecord, TxStatus,
+};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -25,6 +29,7 @@ pub struct Report {
     pub overrides: Vec<OverrideReport>,
     pub fees: FeeSummary,
     pub accounts: Vec<AccountChange>,
+    pub trustlines: Vec<TrustlineChange>,
     pub diff: DiffSummary,
     pub drift: DriftReport,
     pub fetch: FetchStats,
@@ -92,6 +97,8 @@ pub struct StepReport {
 pub struct TxReport {
     pub hash: String,
     pub source: String,
+    /// Who paid the fee: the fee-bump source, else the source.
+    pub fee_source: String,
     pub fee_bid: i64,
     pub resource_fee: i64,
     pub non_refundable_fee: i64,
@@ -112,6 +119,14 @@ pub struct TxReport {
     pub contract_errors: Vec<u32>,
     pub signers: Vec<String>,
     pub replayable: Vec<String>,
+    /// A classic transaction's operation results, in core's codes.
+    pub operations: Vec<String>,
+    /// Its position (from 1) in its ledger's apply order.
+    pub application_order: Option<u32>,
+    /// Why it waited for a later ledger than the one it was sent for.
+    pub deferred: Option<String>,
+    /// Included, then refused by the checks core repeats at apply: the code.
+    pub failed_at_apply: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -152,6 +167,23 @@ pub struct AccountChange {
     pub balance_after: Option<i64>,
     pub seq_before: Option<i64>,
     pub seq_after: Option<i64>,
+    /// Everything else that changed: signers, thresholds, home domain,
+    /// flags, sub-entries (a new account counts from core's defaults).
+    pub changes: Vec<String>,
+    pub overridden: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TrustlineChange {
+    pub account: String,
+    /// `CODE:ISSUER`.
+    pub asset: String,
+    pub balance_before: Option<i64>,
+    pub balance_after: Option<i64>,
+    pub limit_before: Option<i64>,
+    pub limit_after: Option<i64>,
+    /// Whether the issuer authorized the line, after the session.
+    pub authorized: Option<bool>,
     pub overridden: bool,
 }
 
@@ -227,7 +259,7 @@ pub struct FieldComparison {
 pub fn describe_key(key: &LedgerKey) -> String {
     match key {
         LedgerKey::Account(a) => a.account_id.to_string(),
-        LedgerKey::Trustline(t) => format!("{} / {:?}", t.account_id, t.asset),
+        LedgerKey::Trustline(t) => format!("{} / {}", t.account_id, trustline_asset_text(&t.asset)),
         LedgerKey::ContractData(d) => {
             let durability = match d.durability {
                 ContractDataDurability::Persistent => "persistent",
@@ -242,6 +274,17 @@ pub fn describe_key(key: &LedgerKey) -> String {
         LedgerKey::ContractCode(c) => format!("code {}", hex(&c.hash.0)),
         LedgerKey::ConfigSetting(c) => format!("config {:?}", c.config_setting_id),
         other => other.name().to_string(),
+    }
+}
+
+/// `CODE:ISSUER`, `native`, or a pool share's id.
+pub fn trustline_asset_text(a: &TrustLineAsset) -> String {
+    let code = |c: &[u8]| String::from_utf8_lossy(c).trim_end_matches('\0').to_string();
+    match a {
+        TrustLineAsset::Native => "native".into(),
+        TrustLineAsset::CreditAlphanum4(x) => format!("{}:{}", code(&x.asset_code.0), x.issuer),
+        TrustLineAsset::CreditAlphanum12(x) => format!("{}:{}", code(&x.asset_code.0), x.issuer),
+        TrustLineAsset::PoolShare(id) => format!("pool share {}", hex(&id.0 .0)),
     }
 }
 
@@ -364,13 +407,42 @@ impl Report {
         let _ = writeln!(m);
 
         let _ = writeln!(m, "## Accounts\n");
-        let _ = writeln!(m, "| Account | Balance before, XLM | Balance after, XLM | Sequence before → after | Overridden |\n|---|---|---|---|---|");
+        let _ = writeln!(m, "| Account | Balance before, XLM | Balance after, XLM | Sequence before → after | Other changes | Overridden |\n|---|---|---|---|---|---|");
+        let b = |v: Option<i64>| v.map(xlm).unwrap_or_else(|| "—".into());
+        let q = |v: Option<i64>| v.map(|n| n.to_string()).unwrap_or_else(|| "—".into());
         for a in &self.accounts {
-            let b = |v: Option<i64>| v.map(xlm).unwrap_or_else(|| "—".into());
-            let q = |v: Option<i64>| v.map(|n| n.to_string()).unwrap_or_else(|| "—".into());
-            let _ = writeln!(m, "| `{}` | {} | {} | {} → {} | {} |", a.account, b(a.balance_before), b(a.balance_after), q(a.seq_before), q(a.seq_after), if a.overridden { "yes" } else { "" });
+            let _ = writeln!(
+                m,
+                "| `{}` | {} | {} | {} → {} | {} | {} |",
+                a.account,
+                b(a.balance_before),
+                b(a.balance_after),
+                q(a.seq_before),
+                q(a.seq_after),
+                cell(&a.changes.join("; ")),
+                if a.overridden { "yes" } else { "" }
+            );
         }
         let _ = writeln!(m);
+        if !self.trustlines.is_empty() {
+            let _ = writeln!(m, "## Trustlines\n");
+            let _ = writeln!(m, "| Account | Asset | Balance before → after | Limit before → after | Authorized | Overridden |\n|---|---|---|---|---|---|");
+            for t in &self.trustlines {
+                let _ = writeln!(
+                    m,
+                    "| `{}` | `{}` | {} → {} | {} → {} | {} | {} |",
+                    t.account,
+                    cell(&t.asset),
+                    b(t.balance_before),
+                    b(t.balance_after),
+                    b(t.limit_before),
+                    b(t.limit_after),
+                    t.authorized.map_or("—", |x| if x { "yes" } else { "no" }),
+                    if t.overridden { "yes" } else { "" }
+                );
+            }
+            let _ = writeln!(m);
+        }
 
         let by_type: Vec<String> = self.diff.by_type.iter().map(|(k, v)| format!("{v} {k}")).collect();
         let _ = writeln!(m, "## Final diff vs the fork point ({} entries: {})\n", self.diff.total, by_type.join(", "));
@@ -448,8 +520,9 @@ pub fn session_fidelity() -> Vec<String> {
     };
     vec![
         format!("Host-exact: contracts run in the same soroban-env-host release as the network's protocol, in enforcing mode, with a module cache, {metering}, and every auth signature is verified."),
-        "Transaction layer: a port of stellar-core's checks (preconditions, sequence numbers, signature weights and thresholds, v1 and fee-bump envelopes, fee bid, resource fee and limits, balance above reserve, fee charged before apply, disk-read metering, rent and refund), checked against real mainnet and testnet transactions by `soroban-sim replay` (docs/replay.md).".into(),
-        "Not modelled: classic operations (funding is an override), ExtendFootprintTtl and RestoreFootprint operations, several transactions per ledger, per-ledger limits and surge pricing (one ledger per transaction at the base fee), and core's PRNG seed.".into(),
+        "Transaction layer: a port of stellar-core's checks (preconditions, sequence numbers, frozen keys, signature weights and thresholds, v1 and fee-bump envelopes, fee bid, resource fee and limits, balance above reserve, fee charged before apply, disk-read metering, rent and refund), checked against real mainnet and testnet transactions by `soroban-sim replay` (docs/replay.md).".into(),
+        "Classic operations: CreateAccount, Payment (XLM and issued assets), SetOptions and ChangeTrust, ported from stellar-core v29 with its result codes and reserves, in v1 or fee-bump envelopes. Several transactions share a ledger in core's order (one per source account, within the per-ledger limits, classic phase first, each phase shuffled by the transaction-set hash, every fee charged to its fee source before any applies, the checks core repeats at apply, refunds last), and each gets core's PRNG seed for the session's own transaction set.".into(),
+        "Not modelled: ExtendFootprintTtl and RestoreFootprint operations, surge pricing (the inclusion fee charged is the base fee per operation unless a replay gives the lane's), core's parallel Soroban clusters (a ledger's Soroban phase is one cluster), and the other classic operations (path payments, offers, liquidity pools, claimable balances, clawback, creating sponsorships).".into(),
         "A head fork reads RPC's latest ledger lazily (drift below lists any entry that changed after the fork ledger); a checkpoint fork rolls every read back to the fork ledger.".into(),
     ]
 }
@@ -493,6 +566,7 @@ pub fn build_report(s: &Session, ctx: ReportContext) -> Report {
     let mut by_type = BTreeMap::new();
     let mut entries = vec![];
     let mut accounts = vec![];
+    let mut trustlines = vec![];
     for d in &diff {
         *by_type.entry(d.key.name().to_string()).or_insert(0) += 1;
         entries.push(DiffReport {
@@ -505,16 +579,34 @@ pub fn build_report(s: &Session, ctx: ReportContext) -> Report {
         });
         if let LedgerKey::Account(a) = &d.key {
             let acct = |e: &Option<StoredEntry>| match e {
-                Some(StoredEntry { entry: LedgerEntry { data: LedgerEntryData::Account(a), .. }, .. }) => Some((a.balance, a.seq_num.0)),
+                Some(StoredEntry { entry: LedgerEntry { data: LedgerEntryData::Account(a), .. }, .. }) => Some(a.clone()),
                 _ => None,
             };
             let (b, a2) = (acct(&d.before), acct(&d.after));
             accounts.push(AccountChange {
                 account: a.account_id.to_string(),
-                balance_before: b.map(|x| x.0),
-                balance_after: a2.map(|x| x.0),
-                seq_before: b.map(|x| x.1),
-                seq_after: a2.map(|x| x.1),
+                balance_before: b.as_ref().map(|x| x.balance),
+                balance_after: a2.as_ref().map(|x| x.balance),
+                seq_before: b.as_ref().map(|x| x.seq_num.0),
+                seq_after: a2.as_ref().map(|x| x.seq_num.0),
+                changes: account_changes(b.as_ref(), a2.as_ref()),
+                overridden: d.overridden,
+            });
+        }
+        if let LedgerKey::Trustline(t) = &d.key {
+            let line = |e: &Option<StoredEntry>| match e {
+                Some(StoredEntry { entry: LedgerEntry { data: LedgerEntryData::Trustline(l), .. }, .. }) => Some(l.clone()),
+                _ => None,
+            };
+            let (b, a2) = (line(&d.before), line(&d.after));
+            trustlines.push(TrustlineChange {
+                account: t.account_id.to_string(),
+                asset: trustline_asset_text(&t.asset),
+                balance_before: b.as_ref().map(|l| l.balance),
+                balance_after: a2.as_ref().map(|l| l.balance),
+                limit_before: b.as_ref().map(|l| l.limit),
+                limit_after: a2.as_ref().map(|l| l.limit),
+                authorized: a2.as_ref().map(|l| l.flags & 1 != 0),
                 overridden: d.overridden,
             });
         }
@@ -554,6 +646,7 @@ pub fn build_report(s: &Session, ctx: ReportContext) -> Report {
             by_payer: by_payer.into_values().collect(),
         },
         accounts,
+        trustlines,
         diff: DiffSummary { total: diff.len(), by_type, entries },
         drift: DriftReport {
             fork_ledger: fork.ledger_seq,
@@ -579,6 +672,7 @@ pub fn tx_report(t: &TxRecord) -> TxReport {
     TxReport {
         hash: hex(&t.hash),
         source: t.source.as_ref().map(|s| s.to_string()).unwrap_or_default(),
+        fee_source: t.fee_source.as_ref().or(t.source.as_ref()).map(|s| s.to_string()).unwrap_or_default(),
         fee_bid: t.fees.bid,
         resource_fee: t.fees.resource_fee,
         non_refundable_fee: t.fees.non_refundable,
@@ -599,5 +693,52 @@ pub fn tx_report(t: &TxRecord) -> TxReport {
         contract_errors: t.contract_errors(),
         signers: t.signers.iter().map(|m| format!("{} for {} (weight {})", m.key, m.account, m.weight)).collect(),
         replayable: t.replayable.clone(),
+        operations: t.op_results.iter().map(op_result_name).collect(),
+        application_order: t.application_order,
+        deferred: t.deferred.clone(),
+        failed_at_apply: t.failed_code.map(|c| c.as_str().to_string()),
     }
+}
+
+/// What changed on an account besides its balance and sequence number. A
+/// new account is compared with the one core's CreateAccount makes.
+fn account_changes(before: Option<&AccountEntry>, after: Option<&AccountEntry>) -> Vec<String> {
+    let Some(after) = after else { return vec![] };
+    let fresh;
+    let before = match before {
+        Some(b) => b,
+        None => {
+            fresh = new_account(after.account_id.clone(), 0, 0);
+            &fresh
+        }
+    };
+    let mut out = vec![];
+    let t = |x: &Thresholds| x.0.iter().map(u8::to_string).collect::<Vec<_>>().join("/");
+    if before.thresholds != after.thresholds {
+        out.push(format!("thresholds (master/low/medium/high) {} → {}", t(&before.thresholds), t(&after.thresholds)));
+    }
+    let weight = |a: &AccountEntry, k: &SignerKey| a.signers.iter().find(|s| s.key == *k).map(|s| s.weight);
+    for s in after.signers.iter() {
+        match weight(before, &s.key) {
+            None => out.push(format!("signer {} added (weight {})", s.key, s.weight)),
+            Some(w) if w != s.weight => out.push(format!("signer {} weight {w} → {}", s.key, s.weight)),
+            Some(_) => {}
+        }
+    }
+    for s in before.signers.iter().filter(|s| weight(after, &s.key).is_none()) {
+        out.push(format!("signer {} removed", s.key));
+    }
+    if before.home_domain != after.home_domain {
+        out.push(format!("home domain {:?} → {:?}", before.home_domain.to_string(), after.home_domain.to_string()));
+    }
+    if before.flags != after.flags {
+        out.push(format!("flags {:#x} → {:#x}", before.flags, after.flags));
+    }
+    if before.inflation_dest != after.inflation_dest {
+        out.push(format!("inflation destination {} → {}", before.inflation_dest.as_ref().map_or("none".into(), |d| d.to_string()), after.inflation_dest.as_ref().map_or("none".into(), |d| d.to_string())));
+    }
+    if before.num_sub_entries != after.num_sub_entries {
+        out.push(format!("sub-entries {} → {}", before.num_sub_entries, after.num_sub_entries));
+    }
+    out
 }

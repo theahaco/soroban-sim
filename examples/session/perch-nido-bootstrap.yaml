@@ -10,6 +10,13 @@
 # `perch-account` Wasm (a88dc881…) is not on any network yet, so it must be in
 # a --wasm-dir. `--var topup_xlm=N` changes the assumed top-up of the root
 # manager (the real balance is not enough for the whole sequence).
+#
+# The accounts the bootstrap needs besides the root manager's (the author
+# admin key's, which pays apply_doc, and the CI delegate's, which pays CI
+# publishes) are created and funded by real CreateAccount operations, and
+# the admin account takes a backup co-signer through SetOptions, so its
+# envelopes need both keys. The only overrides are the root manager's: its
+# key substitution and its top-up.
 name: Perch/Nido mainnet bootstrap
 description: >
   Two sub-registries from the registry root, the stateless registry and the
@@ -17,7 +24,8 @@ description: >
   External ed25519 admin, their name bindings, a CAP-71 CI release, and the
   negative controls: a non-signer envelope, a replay, a wrong-key smart-account
   signature, a fresh fork without the session's deploys, and an expired
-  ci-publish rule.
+  ci-publish rule. The admin's and the CI delegate's G accounts are created by
+  real classic transactions, and the admin account takes a co-signer.
 
 network: mainnet
 
@@ -28,6 +36,7 @@ options:
 keys:
   theahaco: ed25519          # stands in for the root manager's real key
   admin: { ed25519: author-admin }
+  admin_backup: { ed25519: author-admin-backup }   # the admin account's co-signer
   ci: { ed25519: ci-delegate }
   not_a_signer: ed25519
   mallory: ed25519
@@ -63,10 +72,6 @@ setup:
     substitute_master_key: { account: "${theahaco}", key: theahaco }
   - label: theahaco (assumed top-up before the run)
     fund: { account: "${theahaco}", xlm: "${topup_xlm}" }
-  - label: author admin key's G account (pays apply_doc)
-    fund: { account: "${key.admin}", xlm: 50 }
-  - label: CI delegate's G account (pays CI publishes)
-    fund: { account: "${key.ci}", xlm: 20 }
 
 steps:
   - name: the derived ids bootstrap.sh asserts
@@ -77,19 +82,38 @@ steps:
     view: { contract: "${root}", fn: manager }
     expect: { equals: "${theahaco}" }
 
+  # --- accounts: real classic transactions, not overrides --------------------
+  - name: "accounts: theahaco creates the admin's and the CI delegate's G accounts"
+    operations:
+      - create_account: { destination: "${key.admin}", starting_balance: 10 }
+      - create_account: { destination: "${key.ci}", starting_balance: 5 }
+
   # --- create-registry perch, create-registry nido -------------------------
-  - name: "create-registry perch: root.deploy(registry)"
-    invoke:
-      contract: "${root}"
-      fn: deploy
-      args:
-        - { string: registry }
-        - { string: "${registry_version}" }
-        - { string: perch }
-        - { address: "${theahaco}" }
-        - { vec: [{ address: "${theahaco}" }, { address: "${theahaco}" }, { address: "${root}" }] }
-        - void
-    expect: { equals: "${perch}" }
+  # One ledger for two sources: the admin account's co-signer and theahaco's
+  # first deploy (the classic phase applies first).
+  - name: "ledger: co-signer and create-registry perch"
+    ledger:
+      - name: "accounts: the admin account adds a backup co-signer (thresholds 1/2/2)"
+        source: "${key.admin}"
+        sign_with: [admin]
+        set_options: { signer: { key: admin_backup, weight: 1 }, low_threshold: 1, med_threshold: 2, high_threshold: 2 }
+      - name: "create-registry perch: root.deploy(registry)"
+        invoke:
+          contract: "${root}"
+          fn: deploy
+          args:
+            - { string: registry }
+            - { string: "${registry_version}" }
+            - { string: perch }
+            - { address: "${theahaco}" }
+            - { vec: [{ address: "${theahaco}" }, { address: "${theahaco}" }, { address: "${root}" }] }
+            - void
+        expect: { equals: "${perch}" }
+  - name: "negative: the admin's key alone no longer signs for its account"
+    payment: { destination: "${theahaco}", amount: "0.0000001" }
+    source: "${key.admin}"
+    sign_with: [admin]
+    expect: { fails: opBAD_AUTH }
   - name: "create-registry nido: root.deploy(registry)"
     invoke:
       contract: "${root}"
@@ -180,6 +204,7 @@ steps:
         - { u32: 0 }
         - { u64: "${perch_revision}" }
     source: "${key.admin}"
+    sign_with: [admin, admin_backup]
     auth:
       "${perch_author}":
         oz: { digest: addr_oz_v1, rule: { name: admin }, signers: [{ external: { verifier: "${verifier}", key: admin } }] }
@@ -216,6 +241,7 @@ steps:
         - { u32: 0 }
         - { u64: "${nido_revision}" }
     source: "${key.admin}"
+    sign_with: [admin, admin_backup]
     auth:
       "${nido_author}":
         oz: { digest: addr_oz_v1, rule: { name: admin }, signers: [{ external: { verifier: "${verifier}", key: admin } }] }
@@ -249,6 +275,7 @@ steps:
   - name: "negative: smart-account signature by a non-signer"
     invoke: { contract: "${constructorless}", fn: publish_hash, args: [{ string: perch-doc-compiler }, { address: "${perch_author}" }, { bytes: "0808080808080808080808080808080808080808080808080808080808080808" }, { string: "0.3.9" }] }
     source: "${key.admin}"
+    sign_with: [admin, admin_backup]
     auth:
       "${perch_author}":
         oz: { digest: addr_oz_v1, rule: { name: admin-registry }, signers: [{ external: { verifier: "${verifier}", key: mallory } }] }

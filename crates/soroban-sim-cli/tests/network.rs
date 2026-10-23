@@ -28,12 +28,29 @@ fn perch_nido_bootstrap_on_a_mainnet_fork() {
     .unwrap();
 
     assert!(report.passed, "{:#?}", report.failures);
-    // 31 dependent transactions apply; the replay and the non-signer envelope
-    // are rejected, and the expired ci-publish rule fails at apply.
-    assert_eq!((report.fees.applied, report.fees.rejected, report.fees.failed), (31, 2, 1));
-    // Every override is in the report.
-    assert_eq!(report.overrides.len(), 4);
+    // 33 dependent transactions apply; the replay, the non-signer envelope
+    // and the admin's key alone are rejected, and the expired ci-publish rule
+    // fails at apply.
+    assert_eq!((report.fees.applied, report.fees.rejected, report.fees.failed), (33, 3, 1));
+    // Every override is in the report: only the root manager's key and top-up.
+    assert_eq!(report.overrides.len(), 2);
+    assert!(report.overrides.iter().all(|o| o.entry == "GAMPJROHOAW662FINQ4XQOY2ULX5IEGYXCI4SMZYE75EHQBR6PSTJG3M"), "{:#?}", report.overrides);
     assert!(report.safety.replayable.is_empty());
+
+    // The admin's and the CI delegate's accounts were created by a real
+    // CreateAccount transaction, and the admin's co-signer by SetOptions.
+    let key = |name: &str| soroban_sim_core::session::Ed25519Key::throwaway(name).strkey();
+    for (name, xlm) in [("author-admin", 10), ("ci-delegate", 5)] {
+        let a = report.accounts.iter().find(|a| a.account == key(name)).unwrap_or_else(|| panic!("{name} in the report"));
+        assert!(!a.overridden && a.balance_before.is_none(), "{name}: {a:?}");
+        assert!(a.balance_after.unwrap() < xlm * 10_000_000, "{name} paid its own fees");
+    }
+    let admin = report.accounts.iter().find(|a| a.account == key("author-admin")).unwrap();
+    assert!(admin.changes.iter().any(|c| c == &format!("signer {} added (weight 1)", key("author-admin-backup"))), "{:?}", admin.changes);
+    let step = |name: &str| report.steps.iter().find(|s| s.name == name).unwrap_or_else(|| panic!("no step {name}"));
+    let (cosign, perch) = (step("accounts: the admin account adds a backup co-signer (thresholds 1/2/2)"), step("create-registry perch: root.deploy(registry)"));
+    assert_eq!(cosign.ledger, perch.ledger, "one ledger for both");
+    assert_eq!((cosign.tx.as_ref().unwrap().application_order, perch.tx.as_ref().unwrap().application_order), (Some(1), Some(2)), "the classic phase first");
     // Steps that read only network state simulate the same on RPC.
     let compared: Vec<_> = report.differential.iter().filter(|d| d.status != "skipped").collect();
     assert!(!compared.is_empty());

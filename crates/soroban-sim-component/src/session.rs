@@ -49,6 +49,8 @@ impl GuestSession for NetworkSession {
         // A header that does not decode is dropped for one built from the
         // fork point, as for a snapshot base.
         let header = config.header_xdr.and_then(|b| LedgerHeader::from_xdr(b, Limits::none()).ok());
+        // The header's maxTxSetSize is the classic per-ledger limit.
+        options.max_tx_set_size = header.as_ref().map(|h| h.max_tx_set_size);
         let facade = FacadeConfig {
             network_name: config.network_name,
             passphrase: config.network_passphrase,
@@ -246,7 +248,7 @@ mod tests {
         let s = NetworkSession::new(config());
         let first = s.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"getNetwork"}"#.into()).unwrap();
         let Reply::NeedsState(keys) = first else { panic!("expected needs-state, got {first:?}") };
-        assert_eq!(keys.len(), 13);
+        assert_eq!(keys.len(), soroban_sim_facade::deferred::OPEN_SETTINGS.len());
         let (r, rounds) = answer(&s, || s.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"getNetwork"}"#.into()));
         assert_eq!(rounds, 1);
         assert_eq!(r["result"]["passphrase"], PASSPHRASE);
