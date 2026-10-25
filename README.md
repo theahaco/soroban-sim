@@ -2,6 +2,23 @@
 
 Portable Soroban simulation spike for browsers, WASI Preview 2 components, and native Rust.
 
+## Why rehearse on a fork
+
+Testnet is shared, and its costs can move away from mainnet's. On 2026-10-25,
+testnet's live Soroban state (about 4.2 GB) had grown past the network's 4 GB
+state target. Above the target, rent rises steeply. Writing one new persistent
+entry and keeping it for the maximum TTL simulated at 400–510 XLM, against under
+1 XLM five days earlier. Uploading a 7 KB contract cost about 2,000 XLM, more
+than a plain transaction's fee can be. A network configuration upgrade at ledger
+5,385,212 (17:34:07 UTC that day) raised the target to 7 GB, and costs fell back.
+Mainnet held about 1.7 GB against a 3 GB target throughout.
+
+Soroban Sim loads the network configuration from the forked ledger's own
+`ConfigSetting` entries. A session forked from mainnet
+([network sessions](#network-sessions), `soroban-sim serve --fork mainnet`)
+therefore prices fees and rent as mainnet would, runs on your own machine, and
+adds no load to testnet.
+
 ## Installation and releases
 
 The command-line tool is the `soroban-sim-cli` package; its executable is
