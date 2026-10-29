@@ -1,10 +1,11 @@
-//! Applying a validated transaction the way stellar-core does: charge the fee
-//! to the fee source and consume the source's sequence number (and any
-//! pre-authorized-transaction signer), read the footprint as core reads it
-//! (classic and restored entries metered as disk reads, archived entries
-//! restored only when marked, entry size limits), run the host in enforcing
-//! mode with a module cache, meter writes and events, charge rent and events
-//! against the refundable fee, commit, and refund the rest.
+//! Applying a validated Soroban transaction the way stellar-core does: read
+//! the footprint as core reads it (classic and restored entries metered as
+//! disk reads, archived entries restored only when marked, entry size
+//! limits), run the host in enforcing mode with a module cache, meter writes
+//! and events, charge rent and events against the refundable fee and commit.
+//! The ledger close around it charges the fee to the fee source and consumes
+//! the sequence number (and any pre-authorized-transaction signer) before,
+//! and credits the refund after every transaction of the ledger.
 
 use anyhow::{anyhow, Result};
 use sha2::{Digest, Sha256};
@@ -31,7 +32,7 @@ use host::fees::{compute_rent_fee, compute_transaction_resource_fee, FeeConfigur
 use host::{Host, ModuleCache, DEFAULT_XDR_RW_LIMITS};
 
 use super::ledger::{is_temporary, ForkedLedger, StoredEntry};
-use super::validator::{bump_sequence, TxLimits, ValidTx};
+use super::validator::{TxLimits, ValidTx};
 
 /// How an applied `InvokeHostFunction` operation failed, as core's result
 /// code names it.
@@ -146,6 +147,8 @@ pub struct Applied {
     pub result: std::result::Result<ScVal, Failure>,
     /// Fee kept after the refund.
     pub fee_charged: i64,
+    /// The unused refundable fee, credited when the ledger's transactions
+    /// have all applied.
     pub refund: i64,
     /// Rent and events: the refundable fee actually consumed.
     pub rent_fee: i64,
@@ -171,8 +174,6 @@ pub struct Applier {
     module_cache: ModuleCache,
     compile_host: Host,
     cached: BTreeSet<Hash>,
-    /// Transactions applied so far: part of each one's PRNG seed.
-    pub(super) tx_index: u32,
 }
 
 impl Applier {
@@ -185,7 +186,7 @@ impl Applier {
         let empty = || ContractCostParams(VecM::default());
         let compile_host = Host::with_storage_and_budget(Default::default(), Budget::try_from_configs(u64::MAX, u64::MAX, empty(), empty())?);
         let module_cache = ModuleCache::new(&compile_host)?;
-        Ok(Self { module_cache, compile_host, cached: BTreeSet::new(), tx_index: 0 })
+        Ok(Self { module_cache, compile_host, cached: BTreeSet::new() })
     }
 
     /// Wasm hashes in the module cache.
@@ -193,19 +194,20 @@ impl Applier {
         &self.cached
     }
 
-    /// Parse every live contract code entry in `keys` into the cache. Code
-    /// uploaded in ledger N is only seen here by a later transaction, which in
-    /// a one-transaction-per-ledger session matches core adding it when N closes.
+    /// Parse every live contract code entry in `keys` into the cache, except
+    /// code written in the ledger being applied: core adds code uploaded in
+    /// ledger N to its cache only when N closes, so a later transaction of N
+    /// pays to parse it.
     pub fn cache_code(&mut self, ledger: &ForkedLedger, keys: &[LedgerKey], info: &soroban_env_host::LedgerInfo) -> Result<()> {
         for k in keys {
             let LedgerKey::ContractCode(c) = k else { continue };
             if self.cached.contains(&c.hash) {
                 continue;
             }
-            let Some(StoredEntry { entry: LedgerEntry { data: LedgerEntryData::ContractCode(code), .. }, live_until }) = ledger.get(k)? else {
+            let Some(StoredEntry { entry: LedgerEntry { data: LedgerEntryData::ContractCode(code), last_modified_ledger_seq, .. }, live_until }) = ledger.get(k)? else {
                 continue;
             };
-            if live_until.is_some_and(|l| l >= info.sequence_number) {
+            if last_modified_ledger_seq < info.sequence_number && live_until.is_some_and(|l| l >= info.sequence_number) {
                 self.module_cache.parse_and_cache_module_simple(&self.compile_host, info.protocol_version, code.code.as_slice())?;
                 self.cached.insert(c.hash.clone());
             }
@@ -213,6 +215,8 @@ impl Applier {
         Ok(())
     }
 
+    /// Apply `tx`, whose fee is charged and sequence number consumed. `seed` is
+    /// the host's PRNG seed. The refund is computed, not credited.
     #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &mut self,
@@ -222,26 +226,10 @@ impl Applier {
         limits: &TxLimits,
         tx: &ValidTx,
         enable_diagnostics: bool,
-        prng_seed: Option<[u8; 32]>,
+        seed: [u8; 32],
     ) -> Result<Applied> {
         let seq = info.sequence_number;
-        // Fee, sequence number and one-time signers are consumed from here
-        // on, success or not.
         let fee = tx.fees.charged_up_front();
-        let mut payer = ledger.account(&tx.fee_source)?.ok_or_else(|| anyhow!("fee source vanished"))?;
-        payer.balance -= fee.min(payer.balance);
-        ledger.put_account(payer, seq)?;
-        if tx.inner_hash.is_some() {
-            remove_one_time_signer(ledger, &tx.fee_source, tx.hash, seq)?;
-        }
-        let mut account = ledger.account(&tx.source)?.ok_or_else(|| anyhow!("source account vanished"))?;
-        bump_sequence(&mut account, tx.seq_num, seq, info.timestamp);
-        ledger.put_account(account, seq)?;
-        let tx_hash = tx.inner_hash.unwrap_or(tx.hash);
-        remove_one_time_signer(ledger, &tx.source, tx_hash, seq)?;
-        if tx.op_source != tx.source {
-            remove_one_time_signer(ledger, &tx.op_source, tx_hash, seq)?;
-        }
 
         let r = &tx.data.resources;
         let mut applied = Applied {
@@ -294,7 +282,7 @@ impl Applier {
                 applied.metrics.note_disk_read(false, key_size, bytes.as_ref().map_or(0, |b| b.len() as u32));
                 if applied.metrics.ledger_read_byte > r.disk_read_bytes {
                     let why = format!("RESOURCE_LIMIT_EXCEEDED: read {} disk bytes, declared {}", applied.metrics.ledger_read_byte, r.disk_read_bytes);
-                    return self.fail(ledger, tx, applied, seq, OpFailure::ResourceLimitExceeded, why);
+                    return self.fail(tx, applied, OpFailure::ResourceLimitExceeded, why);
                 }
                 entries.push((bytes, None));
                 continue;
@@ -312,7 +300,7 @@ impl Applier {
             };
             if live_until >= seq {
                 if let Some(why) = limits.entry_too_big(k, size) {
-                    return self.fail(ledger, tx, applied, seq, OpFailure::ResourceLimitExceeded, format!("RESOURCE_LIMIT_EXCEEDED: {why}"));
+                    return self.fail(tx, applied, OpFailure::ResourceLimitExceeded, format!("RESOURCE_LIMIT_EXCEEDED: {why}"));
                 }
                 applied.metrics.read_entry += 1;
                 entries.push((Some(bytes), ttl(live_until)?));
@@ -326,15 +314,15 @@ impl Applier {
             let index = i.checked_sub(n_ro).map(|j| j as u32);
             if !index.is_some_and(|j| marked.contains(&j)) {
                 let why = format!("ENTRY_ARCHIVED: archived {} in the {} footprint is not marked for restore", k.name(), if index.is_some() { "read-write" } else { "read-only" });
-                return self.fail(ledger, tx, applied, seq, OpFailure::EntryArchived, why);
+                return self.fail(tx, applied, OpFailure::EntryArchived, why);
             }
             if let Some(why) = limits.entry_too_big(k, size) {
-                return self.fail(ledger, tx, applied, seq, OpFailure::ResourceLimitExceeded, format!("RESOURCE_LIMIT_EXCEEDED: {why}"));
+                return self.fail(tx, applied, OpFailure::ResourceLimitExceeded, format!("RESOURCE_LIMIT_EXCEEDED: {why}"));
             }
             applied.metrics.note_disk_read(code, key_size, size);
             if applied.metrics.ledger_read_byte > r.disk_read_bytes {
                 let why = format!("RESOURCE_LIMIT_EXCEEDED: read {} disk bytes, declared {}", applied.metrics.ledger_read_byte, r.disk_read_bytes);
-                return self.fail(ledger, tx, applied, seq, OpFailure::ResourceLimitExceeded, why);
+                return self.fail(tx, applied, OpFailure::ResourceLimitExceeded, why);
             }
             restored.extend(index);
             entries.push((Some(bytes), ttl(restored_live_until)?));
@@ -342,8 +330,6 @@ impl Applier {
         applied.restored = restored.len() as u32;
 
         let auth: Vec<Vec<u8>> = tx.op.auth.iter().map(|a| a.to_xdr(DEFAULT_XDR_RW_LIMITS)).collect::<Result<_, _>>()?;
-        let seed = prng_seed.unwrap_or_else(|| super::prng_seed(b"apply", seq, self.tx_index));
-        self.tx_index += 1;
         let mut diagnostics = vec![];
         let res = e2e_invoke::invoke_host_function(
             &budget,
@@ -377,7 +363,7 @@ impl Applier {
             } else {
                 OpFailure::Trapped
             };
-            return self.fail(ledger, tx, applied, seq, code, format!("{error:?}"));
+            return self.fail(tx, applied, code, format!("{error:?}"));
         }
         let res = res.map_err(|e| anyhow!("{e:?}"))?;
         let encoded_value = res.encoded_invoke_result.as_ref().map_err(|e| anyhow!("{e:?}"))?;
@@ -389,12 +375,12 @@ impl Applier {
             let Some(v) = &change.encoded_new_value else { continue };
             let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none())?;
             if let Some(why) = limits.entry_too_big(&key, v.len() as u32) {
-                return self.fail(ledger, tx, applied, seq, OpFailure::ResourceLimitExceeded, format!("RESOURCE_LIMIT_EXCEEDED: {why}"));
+                return self.fail(tx, applied, OpFailure::ResourceLimitExceeded, format!("RESOURCE_LIMIT_EXCEEDED: {why}"));
             }
             applied.metrics.note_write(matches!(key, LedgerKey::ContractCode(_)), change.encoded_key.len() as u32, v.len() as u32);
             if applied.metrics.ledger_write_byte > r.write_bytes {
                 let why = format!("RESOURCE_LIMIT_EXCEEDED: wrote {} bytes, declared {}", applied.metrics.ledger_write_byte, r.write_bytes);
-                return self.fail(ledger, tx, applied, seq, OpFailure::ResourceLimitExceeded, why);
+                return self.fail(tx, applied, OpFailure::ResourceLimitExceeded, why);
             }
         }
         applied.write_bytes = applied.metrics.ledger_write_byte;
@@ -407,7 +393,7 @@ impl Applier {
         let events_size = applied.metrics.emit_event_byte;
         if events_size > limits.tx_max_contract_events_size_bytes {
             let why = format!("RESOURCE_LIMIT_EXCEEDED: events and return value {events_size} bytes > network maximum {}", limits.tx_max_contract_events_size_bytes);
-            return self.fail(ledger, tx, applied, seq, OpFailure::ResourceLimitExceeded, why);
+            return self.fail(tx, applied, OpFailure::ResourceLimitExceeded, why);
         }
         applied.rent_fee = compute_rent_fee(&e2e_invoke::extract_rent_changes(&res.ledger_changes), &rent_fee_configuration(config), seq);
         let (_, events_fee) = compute_transaction_resource_fee(
@@ -418,7 +404,7 @@ impl Applier {
         let consumed = applied.rent_fee + events_fee;
         if consumed > tx.fees.refundable {
             let why = format!("INSUFFICIENT_REFUNDABLE_FEE: rent and events cost {consumed}, the refundable fee is {}", tx.fees.refundable);
-            return self.fail(ledger, tx, applied, seq, OpFailure::InsufficientRefundableFee, why);
+            return self.fail(tx, applied, OpFailure::InsufficientRefundableFee, why);
         }
 
         // Commit every footprint change: new values, deletions, TTL bumps.
@@ -457,10 +443,7 @@ impl Applier {
             .collect::<Result<_, _>>()?;
         let preimage = InvokeHostFunctionSuccessPreImage { return_value: value.clone(), events: applied.events.clone().try_into()? };
         applied.success_hash = Some(Sha256::digest(preimage.to_xdr(Limits::none())?).into());
-        // The fee source may itself be in the footprint, so the refund goes
-        // onto its latest value.
         let refund = tx.fees.refundable - consumed;
-        self.refund(ledger, &tx.fee_source, refund, seq)?;
         applied.refund = refund;
         applied.fee_charged = fee - refund;
         applied.result = Ok(value);
@@ -469,8 +452,7 @@ impl Applier {
 
     /// A failed operation consumes no refundable resources: the whole
     /// refundable fee comes back, and the rest stays charged.
-    fn fail(&self, ledger: &ForkedLedger, tx: &ValidTx, mut applied: Applied, seq: u32, code: OpFailure, reason: String) -> Result<Applied> {
-        self.refund(ledger, &tx.fee_source, tx.fees.refundable, seq)?;
+    fn fail(&self, tx: &ValidTx, mut applied: Applied, code: OpFailure, reason: String) -> Result<Applied> {
         applied.refund = tx.fees.refundable;
         applied.fee_charged = tx.fees.charged_up_front() - tx.fees.refundable;
         applied.rent_fee = 0;
@@ -478,21 +460,11 @@ impl Applier {
         applied.result = Err(Failure { code, reason });
         Ok(applied)
     }
-
-    /// core's `refundSorobanFee`: nothing comes back to a merged account.
-    fn refund(&self, ledger: &ForkedLedger, fee_source: &AccountId, amount: i64, seq: u32) -> Result<()> {
-        if amount == 0 {
-            return Ok(());
-        }
-        let Some(mut account) = ledger.account(fee_source)? else { return Ok(()) };
-        account.balance += amount;
-        ledger.put_account(account, seq)
-    }
 }
 
 /// core's `removeOneTimeSignerKey…`: a pre-authorized-transaction signer for
 /// this transaction is removed from the account once the transaction applies.
-fn remove_one_time_signer(ledger: &ForkedLedger, id: &AccountId, tx_hash: [u8; 32], seq: u32) -> Result<()> {
+pub(super) fn remove_one_time_signer(ledger: &ForkedLedger, id: &AccountId, tx_hash: [u8; 32], seq: u32) -> Result<()> {
     let Some(mut a) = ledger.account(id)? else { return Ok(()) };
     let key = SignerKey::PreAuthTx(Uint256(tx_hash));
     let Some(pos) = a.signers.iter().position(|s| s.key == key) else { return Ok(()) };

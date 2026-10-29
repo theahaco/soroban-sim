@@ -27,6 +27,9 @@ pub struct SnapshotFork {
     pub protocol_version: u32,
     pub base_fee: u32,
     pub base_reserve: u32,
+    /// The base header's `maxTxSetSize`; absent: no classic per-ledger limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tx_set_size: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,7 +40,7 @@ pub struct SnapshotEntry {
 }
 
 impl SnapshotFile {
-    pub fn new(passphrase: &str, fork: &ForkPoint, entries: &[StoredEntry]) -> Result<Self> {
+    pub fn new(passphrase: &str, fork: &ForkPoint, max_tx_set_size: Option<u32>, entries: &[StoredEntry]) -> Result<Self> {
         let mut entries: Vec<SnapshotEntry> = entries
             .iter()
             .map(|e| Ok(SnapshotEntry { entry: B64.encode(e.entry.to_xdr(Limits::none())?), live_until: e.live_until }))
@@ -52,6 +55,7 @@ impl SnapshotFile {
                 protocol_version: fork.protocol_version,
                 base_fee: fork.base_fee,
                 base_reserve: fork.base_reserve,
+                max_tx_set_size,
             },
             entries,
         })

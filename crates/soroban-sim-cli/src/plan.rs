@@ -243,6 +243,23 @@ pub struct Step {
     /// A signed `TransactionEnvelope` (base64 XDR), submitted as is.
     #[serde(default)]
     pub envelope: Option<String>,
+    /// Classic operations, each a one-operation transaction.
+    #[serde(default)]
+    pub create_account: Option<CreateAccountSpec>,
+    #[serde(default)]
+    pub payment: Option<PaymentSpec>,
+    #[serde(default)]
+    pub set_options: Option<SetOptionsSpec>,
+    #[serde(default)]
+    pub change_trust: Option<ChangeTrustSpec>,
+    /// A classic transaction of several operations.
+    #[serde(default)]
+    pub operations: Option<Vec<OperationSpec>>,
+    /// Transaction steps submitted for the same ledger: one transaction per
+    /// source account and the per-ledger limits apply, and what does not fit
+    /// waits for the next ledger.
+    #[serde(default)]
+    pub ledger: Option<Vec<Step>>,
     #[serde(default)]
     pub advance: Option<AdvanceSpec>,
     #[serde(default)]
@@ -273,6 +290,9 @@ pub struct Step {
     /// Save the step's signed envelope (base64 XDR) under this name.
     #[serde(default)]
     pub save_envelope: Option<String>,
+    /// Wrap the transaction in a fee bump: another account pays its fee.
+    #[serde(default)]
+    pub fee_bump: Option<FeeBumpSpec>,
     /// For `view`: run against a fresh fork, without the session's writes
     /// and overrides.
     #[serde(default)]
@@ -284,6 +304,122 @@ pub struct Step {
     pub save: Option<String>,
     #[serde(default)]
     pub expect: Option<Expect>,
+}
+
+/// A fee bump around a transaction step: `source` pays the fee (and gets
+/// any refund) instead of the transaction's own source.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeeBumpSpec {
+    /// The fee source (a G address, or `${key.NAME}`).
+    pub source: String,
+    /// The outer fee in stroops. Default: the inner transaction's inclusion
+    /// fee rate over one more operation (at least the base fee each), plus
+    /// its resource fee.
+    #[serde(default)]
+    pub fee: Option<ValueExpr>,
+    /// Who signs the fee bump (key names). Default: the classic signers
+    /// registered for the fee source, else the key whose account it is.
+    #[serde(default)]
+    pub sign_with: Option<Vec<String>>,
+}
+
+/// `CreateAccount`: a new account funded from the source.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateAccountSpec {
+    /// The new account (a G address, or `${key.NAME}`).
+    pub destination: String,
+    /// XLM, as a number or a decimal string with up to 7 places.
+    pub starting_balance: ValueExpr,
+}
+
+/// `Payment`: XLM or an issued asset.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaymentSpec {
+    pub destination: String,
+    /// `native` (the default) or `CODE:ISSUER`.
+    #[serde(default)]
+    pub asset: Option<String>,
+    /// In units of the asset, up to 7 decimal places.
+    pub amount: ValueExpr,
+}
+
+/// `SetOptions`. Weights and thresholds are 0 to 255.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetOptionsSpec {
+    #[serde(default)]
+    pub master_weight: Option<u32>,
+    #[serde(default)]
+    pub low_threshold: Option<u32>,
+    #[serde(default)]
+    pub med_threshold: Option<u32>,
+    #[serde(default)]
+    pub high_threshold: Option<u32>,
+    #[serde(default)]
+    pub home_domain: Option<String>,
+    /// Flag names (`auth_required`, `auth_revocable`, `auth_immutable`,
+    /// `auth_clawback_enabled`) or the bits.
+    #[serde(default)]
+    pub set_flags: Option<FlagsSpec>,
+    #[serde(default)]
+    pub clear_flags: Option<FlagsSpec>,
+    #[serde(default)]
+    pub inflation_dest: Option<String>,
+    /// Add, reweigh, or (weight 0) remove an ed25519 signer.
+    #[serde(default)]
+    pub signer: Option<SignerWeightSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum FlagsSpec {
+    Names(Vec<String>),
+    Bits(u32),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignerWeightSpec {
+    /// A plan key's name or a G address.
+    pub key: String,
+    pub weight: u32,
+}
+
+/// `ChangeTrust`: open, change or (limit 0) close a trustline.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeTrustSpec {
+    /// `CODE:ISSUER`.
+    pub asset: String,
+    /// In units of the asset; default the maximum.
+    #[serde(default)]
+    pub limit: Option<ValueExpr>,
+}
+
+/// One operation of an `operations` step.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationSpec {
+    /// The operation's source, if not the transaction's.
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub create_account: Option<CreateAccountSpec>,
+    #[serde(default)]
+    pub payment: Option<PaymentSpec>,
+    #[serde(default)]
+    pub set_options: Option<SetOptionsSpec>,
+    #[serde(default)]
+    pub change_trust: Option<ChangeTrustSpec>,
+}
+
+impl OperationSpec {
+    pub fn actions(&self) -> usize {
+        [self.create_account.is_some(), self.payment.is_some(), self.set_options.is_some(), self.change_trust.is_some()].iter().filter(|b| **b).count()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -365,12 +501,21 @@ impl Plan {
     /// Structural checks that need no network.
     pub fn check(&self) -> Result<()> {
         for (i, step) in self.steps.iter().enumerate() {
-            let n = step.actions();
-            if n != 1 {
-                bail!("step {} ({}) must have exactly one action, has {n}", i + 1, step.label(i));
-            }
-            if step.hold && step.save_envelope.is_none() {
-                bail!("step {} ({}): `hold` needs `save_envelope`", i + 1, step.label(i));
+            step.check(&format!("step {} ({})", i + 1, step.label(i)))?;
+            if let Some(nested) = &step.ledger {
+                if nested.is_empty() {
+                    bail!("step {} ({}): `ledger` needs at least one transaction step", i + 1, step.label(i));
+                }
+                for (j, inner) in nested.iter().enumerate() {
+                    let at = format!("step {}.{} ({})", i + 1, j + 1, inner.label(j));
+                    inner.check(&at)?;
+                    if !inner.is_transaction() || inner.ledger.is_some() {
+                        bail!("{at}: a `ledger` block holds transaction steps only, not {}", inner.kind());
+                    }
+                    if inner.hold {
+                        bail!("{at}: `hold` has no meaning inside a `ledger` block");
+                    }
+                }
             }
         }
         for (name, k) in &self.keys {
@@ -385,6 +530,30 @@ impl Plan {
 }
 
 impl Step {
+    fn check(&self, at: &str) -> Result<()> {
+        let n = self.actions();
+        if n != 1 {
+            bail!("{at} must have exactly one action, has {n}");
+        }
+        if self.hold && self.save_envelope.is_none() {
+            bail!("{at}: `hold` needs `save_envelope`");
+        }
+        if self.fee_bump.is_some() && !self.is_transaction() {
+            bail!("{at}: `fee_bump` needs a transaction step");
+        }
+        if let Some(ops) = &self.operations {
+            if ops.is_empty() {
+                bail!("{at}: `operations` needs at least one operation");
+            }
+            for (k, op) in ops.iter().enumerate() {
+                if op.actions() != 1 {
+                    bail!("{at}: operation {} must be exactly one of create_account, payment, set_options, change_trust", k + 1);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn actions(&self) -> usize {
         [
             self.invoke.is_some(),
@@ -392,6 +561,12 @@ impl Step {
             self.deploy.is_some(),
             self.deploy_sac.is_some(),
             self.envelope.is_some(),
+            self.create_account.is_some(),
+            self.payment.is_some(),
+            self.set_options.is_some(),
+            self.change_trust.is_some(),
+            self.operations.is_some(),
+            self.ledger.is_some(),
             self.advance.is_some(),
             self.view.is_some(),
             self.set.is_some(),
@@ -414,6 +589,18 @@ impl Step {
             "deploy_sac"
         } else if self.envelope.is_some() {
             "envelope"
+        } else if self.create_account.is_some() {
+            "create_account"
+        } else if self.payment.is_some() {
+            "payment"
+        } else if self.set_options.is_some() {
+            "set_options"
+        } else if self.change_trust.is_some() {
+            "change_trust"
+        } else if self.operations.is_some() {
+            "operations"
+        } else if self.ledger.is_some() {
+            "ledger"
         } else if self.advance.is_some() {
             "advance"
         } else if self.view.is_some() {
@@ -432,7 +619,15 @@ impl Step {
     }
 
     pub fn is_transaction(&self) -> bool {
-        matches!(self.kind(), "invoke" | "upload" | "deploy" | "deploy_sac" | "envelope")
+        matches!(
+            self.kind(),
+            "invoke" | "upload" | "deploy" | "deploy_sac" | "envelope" | "create_account" | "payment" | "set_options" | "change_trust" | "operations"
+        )
+    }
+
+    /// A step of classic operations.
+    pub fn is_classic(&self) -> bool {
+        matches!(self.kind(), "create_account" | "payment" | "set_options" | "change_trust" | "operations")
     }
 }
 

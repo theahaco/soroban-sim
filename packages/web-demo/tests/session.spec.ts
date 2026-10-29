@@ -132,6 +132,18 @@ test("a two-step dependent sequence runs on a recorded testnet fork and survives
   expect(asked.slice(before)).toEqual([]);
 });
 
+test("a plan with classic-operation steps is refused at import with a pointer to the CLI", async ({ page, context }) => {
+  test.setTimeout(120_000);
+  await recordedRpc(context, TESTNET_RPC, testnetFork());
+  await fork(page, "testnet");
+  const before = await page.locator("#session-steps li").count();
+  const plan = ["keys: { alice: ed25519, carol: ed25519 }", "steps:", "  - create_account: { destination: \"${key.carol}\", starting_balance: 5 }", "    source: \"${key.alice}\""].join("\n");
+  await page.locator("#session-plan-file").setInputFiles({ name: "classic.yaml", mimeType: "text/yaml", buffer: Buffer.from(plan) });
+  await expect(page.locator("#session-err")).toContainText("step 1: create_account steps need `soroban-sim session run`");
+  // Nothing ran: not even the plan's first step.
+  await expect(page.locator("#session-steps li")).toHaveCount(before);
+});
+
 test("plan steps sign classic authorization entries with throwaway keys", async ({ page, context }) => {
   test.setTimeout(120_000);
   await recordedRpc(context, TESTNET_RPC, testnetFork());

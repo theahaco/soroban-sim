@@ -28,6 +28,10 @@ fn alice() -> Ed25519Key {
 }
 
 fn snapshot(dir: &Path) -> PathBuf {
+    snapshot_with(dir, None)
+}
+
+fn snapshot_with(dir: &Path, max_tx_set_size: Option<u32>) -> PathBuf {
     let raw = std::fs::read_to_string(repo().join("fixtures/parity/native-sac-transfer.json")).unwrap();
     let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
     let mut entries: Vec<StoredEntry> = json["snapshot"]
@@ -50,7 +54,7 @@ fn snapshot(dir: &Path) -> PathBuf {
     });
     let fork = ForkPoint { ledger_seq: FORK_LEDGER, close_time: 1_800_000_000, protocol_version: host_protocol(), base_reserve: 5_000_000, base_fee: 100 };
     let path = dir.join("base.snapshot.json");
-    SnapshotFile::new(TESTNET_PASSPHRASE, &fork, &entries).unwrap().save(&path).unwrap();
+    SnapshotFile::new(TESTNET_PASSPHRASE, &fork, max_tx_set_size, &entries).unwrap().save(&path).unwrap();
     path
 }
 
@@ -220,6 +224,137 @@ fn the_report_prefix_keeps_its_name_and_never_overwrites_the_plan() {
     assert!(dir.join("run.v1.json").is_file() && dir.join("run.v1.md").is_file());
 }
 
+#[test]
+fn classic_steps_and_ledger_blocks() {
+    let dir = scratch("classic");
+    let plan = dir.join("plan.yaml");
+    std::fs::write(
+        &plan,
+        r#"
+options: { source: "${alice}" }
+keys: { alice: ed25519, carol: ed25519, dave: ed25519, issuer: ed25519, backup: ed25519 }
+vars:
+  usd: "USD:${key.issuer}"
+signers:
+  "${alice}": { classic: [alice] }
+setup:
+  - substitute_master_key: { account: "${alice}", key: alice }
+steps:
+  - name: create carol
+    create_account: { destination: "${key.carol}", starting_balance: 50 }
+  - name: one ledger for three transactions
+    ledger:
+      - name: create dave
+        create_account: { destination: "${key.dave}", starting_balance: "20.5" }
+      - name: create the issuer (alice's second transaction)
+        create_account: { destination: "${key.issuer}", starting_balance: 10 }
+      - name: carol adds a co-signer
+        source: "${key.carol}"
+        set_options: { signer: { key: backup, weight: 1 }, low_threshold: 1, med_threshold: 2, high_threshold: 2, home_domain: carol.invalid }
+        fee_bump: { source: "${alice}" }
+  - name: "negative: carol's master key alone"
+    payment: { destination: "${alice}", amount: 1 }
+    source: "${key.carol}"
+    expect: { fails: opBAD_AUTH }
+  - name: carol and her co-signer pay
+    payment: { destination: "${alice}", amount: "0.5" }
+    source: "${key.carol}"
+    sign_with: [carol, backup]
+  - name: "carol pays again, alice pays the fee"
+    payment: { destination: "${key.dave}", amount: 1 }
+    source: "${key.carol}"
+    sign_with: [carol, backup]
+    fee_bump: { source: "${alice}", fee: 1000 }
+  - name: dave trusts USD, the issuer mints
+    source: "${key.dave}"
+    sign_with: [dave, issuer]
+    operations:
+      - change_trust: { asset: "${usd}", limit: 1000 }
+      - payment: { destination: "${key.dave}", asset: "${usd}", amount: 250 }
+        source: "${key.issuer}"
+  - name: "negative: a payment to nobody"
+    payment: { destination: GAMPJROHOAW662FINQ4XQOY2ULX5IEGYXCI4SMZYE75EHQBR6PSTJG3M, amount: 1 }
+    expect: { fails: PAYMENT_NO_DESTINATION }
+"#,
+    )
+    .unwrap();
+    let mut cfg = config(snapshot(&dir));
+    cfg.plan_path = plan;
+    let report = Runner::new(cfg).unwrap().run(None).unwrap();
+    let rows: Vec<String> = report.steps.iter().map(|s| format!("{} {} [{}] {}: {}", s.index, s.name, s.ledger, s.outcome, s.detail)).collect();
+    assert!(report.passed, "{:#?}\n{rows:#?}", report.failures);
+
+    let step = |name: &str| report.steps.iter().find(|s| s.name == name).unwrap_or_else(|| panic!("no step {name}: {rows:#?}"));
+    let (dave, issuer, cosign) = (step("create dave"), step("create the issuer (alice's second transaction)"), step("carol adds a co-signer"));
+    // dave's and carol's share a ledger; alice's second waits for the next.
+    assert_eq!(dave.ledger, cosign.ledger);
+    assert_eq!(issuer.ledger, dave.ledger + 1);
+    assert!(issuer.tx.as_ref().unwrap().deferred.as_deref().unwrap().contains("one per account"));
+    assert_eq!(dave.tx.as_ref().unwrap().operations, vec!["CREATE_ACCOUNT_SUCCESS"]);
+    // A fee bump inside the ledger block: alice pays carol's fee (one more
+    // operation than carol's: 200), carol's own sequence number is used.
+    let bumped = cosign.tx.as_ref().unwrap();
+    let carol_g = Ed25519Key::throwaway("carol").strkey();
+    assert_eq!((bumped.source.as_str(), bumped.fee_source.as_str(), bumped.fee_charged), (carol_g.as_str(), alice().strkey().as_str(), 200));
+    let again = step("carol pays again, alice pays the fee").tx.as_ref().unwrap();
+    assert_eq!((again.fee_source.as_str(), again.fee_bid, again.fee_charged), (alice().strkey().as_str(), 1000, 200));
+    assert_eq!(step("dave trusts USD, the issuer mints").tx.as_ref().unwrap().operations, vec!["CHANGE_TRUST_SUCCESS", "PAYMENT_SUCCESS"]);
+
+    // Every account is a real transaction's: one override, alice's key.
+    assert_eq!(report.overrides.len(), 1);
+    let carol = Ed25519Key::throwaway("carol").strkey();
+    let c = report.accounts.iter().find(|a| a.account == carol).unwrap();
+    assert!(!c.overridden && c.balance_before.is_none());
+    assert!(c.changes.iter().any(|x| x.starts_with("signer") && x.ends_with("added (weight 1)")), "{:?}", c.changes);
+    assert!(c.changes.iter().any(|x| x == "home domain \"\" → \"carol.invalid\""), "{:?}", c.changes);
+    let line = &report.trustlines[0];
+    assert_eq!((line.balance_after, line.limit_after, line.authorized), (Some(250 * 10_000_000), Some(1000 * 10_000_000), Some(true)));
+    let md = report.to_markdown();
+    assert!(md.contains("## Trustlines") && md.contains("USD:"), "{md}");
+}
+
+#[test]
+fn a_snapshot_keeps_the_classic_per_ledger_limit() {
+    let dir = scratch("classic-limit");
+    let plan = dir.join("plan.yaml");
+    std::fs::write(
+        &plan,
+        r#"
+options: { source: "${alice}" }
+keys: { alice: ed25519, carol: ed25519, dave: ed25519, erin: ed25519 }
+signers:
+  "${alice}": { classic: [alice] }
+setup:
+  - substitute_master_key: { account: "${alice}", key: alice }
+steps:
+  - name: create carol
+    create_account: { destination: "${key.carol}", starting_balance: 50 }
+  - name: two one-operation transactions
+    ledger:
+      - name: create dave
+        create_account: { destination: "${key.dave}", starting_balance: 10 }
+      - name: carol creates erin
+        source: "${key.carol}"
+        create_account: { destination: "${key.erin}", starting_balance: 10 }
+"#,
+    )
+    .unwrap();
+    let ledgers = |base: PathBuf, save: Option<&Path>| {
+        let mut cfg = config(base);
+        cfg.plan_path = plan.clone();
+        let report = Runner::new(cfg).unwrap().run(save).unwrap();
+        assert!(report.passed, "{:#?}", report.failures);
+        let at = |name: &str| report.steps.iter().find(|s| s.name == name).unwrap().ledger;
+        (i64::from(at("carol creates erin")) - i64::from(at("create dave"))).abs()
+    };
+    assert_eq!(ledgers(snapshot(&dir), None), 0, "no limit: one ledger");
+
+    let saved = dir.join("resaved.snapshot.json");
+    assert_eq!(ledgers(snapshot_with(&dir, Some(1)), Some(&saved)), 1, "one operation per ledger: the second waits");
+    assert_eq!(SnapshotFile::load(&saved).unwrap().fork.max_tx_set_size, Some(1));
+    assert_eq!(ledgers(saved, None), 1);
+}
+
 /// The browser session tests' recorded testnet fork
 /// (packages/web-demo/tests/fixtures/testnet-fork.json) as a snapshot file.
 fn recorded_testnet_fork(dir: &Path) -> PathBuf {
@@ -250,7 +385,7 @@ fn recorded_testnet_fork(dir: &Path) -> PathBuf {
         base_fee: header.base_fee,
     };
     let path = dir.join("testnet-fork.snapshot.json");
-    SnapshotFile::new(json["getNetwork"]["passphrase"].as_str().unwrap(), &fork, &entries).unwrap().save(&path).unwrap();
+    SnapshotFile::new(json["getNetwork"]["passphrase"].as_str().unwrap(), &fork, Some(header.max_tx_set_size), &entries).unwrap().save(&path).unwrap();
     path
 }
 

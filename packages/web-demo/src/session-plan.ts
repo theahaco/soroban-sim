@@ -7,9 +7,10 @@
  *
  * The browser runs the plan subset that needs no native signer adapters:
  * ed25519 throwaway keys (the same labels give the same addresses as the
- * CLI), classic signers, and every step kind except `view.fresh_fork`. Plans
- * that need OpenZeppelin, external (secp256r1, WebAuthn) or delegated signers
- * are refused with a pointer to `soroban-sim session run`.
+ * CLI), classic signers, and every contract, clock and override step except
+ * `view.fresh_fork`. Plans that need OpenZeppelin, external (secp256r1,
+ * WebAuthn) or delegated signers, or that have classic-operation or `ledger`
+ * steps, are refused with a pointer to `soroban-sim session run`.
  */
 import {
   Account,
@@ -62,6 +63,8 @@ interface Outcome {
 
 const SUPPORTED_KEYS = new Set(["name", "description", "network", "options", "keys", "vars", "signers", "setup", "steps"]);
 const STEP_ACTIONS = ["invoke", "upload", "deploy", "deploy_sac", "envelope", "view", "advance", "set", "assert", "override"] as const;
+/** Plan steps only `soroban-sim session run` runs. */
+const CLI_ONLY_STEPS = ["create_account", "payment", "set_options", "change_trust", "operations", "ledger"] as const;
 
 class PlanError extends Error {}
 
@@ -129,6 +132,11 @@ class Runner {
       this.keys.set(name, keyFor(name, spec));
     }
     for (const [address, spec] of Object.entries(this.signers)) checkSigner(address, spec);
+    const steps = Array.isArray(plan.steps) ? plan.steps : [];
+    for (const [i, step] of steps.entries()) {
+      const kind = isObj(step) ? CLI_ONLY_STEPS.find((k) => k in step) : undefined;
+      if (kind) throw new PlanError(`step ${i + 1}: ${kind} steps need \`soroban-sim session run\``);
+    }
   }
 
   async run(): Promise<PlanResult> {

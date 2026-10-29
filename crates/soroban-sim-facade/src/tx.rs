@@ -1,6 +1,7 @@
 //! What the facade answers about a transaction it applied: its hash, the
-//! `TransactionResult` core would report, and a `TransactionMeta` (V4, the
-//! shape protocol-23+ RPC serves) rebuilt from the session's record and the
+//! `TransactionResult` core would report (with every operation's result for
+//! a classic transaction), and a `TransactionMeta` (V4, the shape
+//! protocol-23+ RPC serves) rebuilt from the session's record and the
 //! entries it touched, before and after.
 
 use anyhow::Result;
@@ -12,7 +13,7 @@ use soroban_env_host::xdr::{
     SorobanTransactionMetaExt, SorobanTransactionMetaExtV1, SorobanTransactionMetaV2, Transaction, TransactionEnvelope,
     TransactionExt, TransactionMeta, TransactionMetaV4, TransactionResult, TtlEntry, Uint256, WriteXdr,
 };
-use soroban_sim_core::session::{account_key, muxed_account_id, v0_as_v1, StoredEntry, TxRecord, TxStatus};
+use soroban_sim_core::session::{account_key, classic_op_keys, muxed_account_id, v0_as_v1, StoredEntry, TxRecord, TxStatus};
 
 use crate::report::hex;
 
@@ -26,14 +27,18 @@ pub fn contract_id(network_id: [u8; 32], deployer: ScAddress, salt: [u8; 32]) ->
 }
 
 /// Every ledger key a transaction names up front: its source and operation
-/// sources, the accounts of its authorization entries, and its footprint. A
-/// session reads them before validating, in one base fetch.
+/// sources, the accounts of its authorization entries, its footprint, and
+/// what its classic operations touch. A session reads them before
+/// validating, in one base fetch.
 pub fn envelope_keys(tx: &Transaction) -> Vec<LedgerKey> {
-    let mut keys = vec![account_key(&muxed_account_id(&tx.source_account))];
+    let source = muxed_account_id(&tx.source_account);
+    let mut keys = vec![account_key(&source)];
     for op in tx.operations.iter() {
         if let Some(s) = &op.source_account {
             keys.push(account_key(&muxed_account_id(s)));
         }
+        let op_source = op.source_account.as_ref().map(muxed_account_id).unwrap_or_else(|| source.clone());
+        keys.extend(classic_op_keys(&op.body, &op_source));
         if let OperationBody::InvokeHostFunction(ihf) = &op.body {
             for a in ihf.auth.iter() {
                 let address = match &a.credentials {
@@ -78,8 +83,11 @@ pub fn inner_signatures(envelope: &TransactionEnvelope) -> &[DecoratedSignature]
 
 /// A one-line description of what a transaction does, for logs and reports.
 pub fn describe(tx: &Transaction, network_id: [u8; 32]) -> String {
-    let [op] = tx.operations.as_slice() else { return format!("transaction with {} operations", tx.operations.len()) };
-    let OperationBody::InvokeHostFunction(ihf) = &op.body else { return format!("{} operation", op.body.name()) };
+    let [op] = tx.operations.as_slice() else {
+        let ops: Vec<String> = tx.operations.iter().map(describe_classic).collect();
+        return format!("{} operations: {}", tx.operations.len(), ops.join("; "));
+    };
+    let OperationBody::InvokeHostFunction(ihf) = &op.body else { return describe_classic(op) };
     match &ihf.host_function {
         HostFunction::InvokeContract(a) => format!("{}.{}", a.contract_address, a.function_name.to_utf8_string_lossy()),
         HostFunction::UploadContractWasm(code) => {
@@ -88,6 +96,41 @@ pub fn describe(tx: &Transaction, network_id: [u8; 32]) -> String {
         }
         HostFunction::CreateContract(a) => create_description(&a.contract_id_preimage, network_id),
         HostFunction::CreateContractV2(a) => create_description(&a.contract_id_preimage, network_id),
+    }
+}
+
+/// A classic operation in a few words.
+fn describe_classic(op: &soroban_env_host::xdr::Operation) -> String {
+    use soroban_env_host::xdr::Asset;
+    let asset = |a: &Asset| match a {
+        Asset::Native => "XLM".to_string(),
+        Asset::CreditAlphanum4(x) => format!("{}:{}", String::from_utf8_lossy(&x.asset_code.0).trim_end_matches('\0'), x.issuer),
+        Asset::CreditAlphanum12(x) => format!("{}:{}", String::from_utf8_lossy(&x.asset_code.0).trim_end_matches('\0'), x.issuer),
+    };
+    let what = match &op.body {
+        OperationBody::CreateAccount(o) => format!("create account {} with {} XLM", o.destination, soroban_sim_core::session::xlm(o.starting_balance)),
+        OperationBody::Payment(o) => format!("pay {} {} to {}", soroban_sim_core::session::xlm(o.amount), asset(&o.asset), soroban_sim_core::session::muxed_account_id(&o.destination)),
+        OperationBody::SetOptions(o) => {
+            let mut parts = vec![];
+            if let Some(s) = &o.signer {
+                parts.push(format!("signer {} weight {}", s.key, s.weight));
+            }
+            for (name, v) in [("master weight", o.master_weight), ("low", o.low_threshold), ("medium", o.med_threshold), ("high", o.high_threshold)] {
+                if let Some(v) = v {
+                    parts.push(format!("{name} {v}"));
+                }
+            }
+            if let Some(d) = &o.home_domain {
+                parts.push(format!("home domain {:?}", d.to_string()));
+            }
+            format!("set options ({})", parts.join(", "))
+        }
+        OperationBody::ChangeTrust(o) => format!("change trust (limit {})", soroban_sim_core::session::xlm(o.limit)),
+        other => format!("{} operation", other.name()),
+    };
+    match &op.source_account {
+        Some(s) => format!("{what} [from {}]", soroban_sim_core::session::muxed_account_id(s)),
+        None => what,
     }
 }
 
@@ -131,10 +174,12 @@ pub struct Touched {
 
 /// A `TransactionMeta` V4 for an applied (or failed) transaction. The source
 /// account's sequence number and the fee source's fee and refund (the same
-/// account unless fee-bumped) are `tx_changes_before`; the
-/// operation's footprint changes, data and TTL entries alike, are the
-/// operation's changes. This is a reconstruction from before and after
-/// values, not core's exact change list.
+/// account unless fee-bumped) are `tx_changes_before`. A Soroban operation's
+/// changes are its footprint's, data and TTL entries alike; a classic
+/// transaction's operations each get the changes the session recorded for
+/// them (those accounts' aside). This is a reconstruction from before and
+/// after values, not core's exact change list, and in a ledger of several
+/// transactions "before" is the ledger's start.
 pub fn meta(record: &TxRecord, accounts: &[Touched], footprint: &[Touched], apply_ledger: u32) -> Result<TransactionMeta> {
     let applied = record.status.is_applied();
     let mut op_changes = vec![];
@@ -147,6 +192,22 @@ pub fn meta(record: &TxRecord, accounts: &[Touched], footprint: &[Touched], appl
     for a in accounts {
         before_changes.extend(changes(a, apply_ledger)?);
     }
+    let operations: Vec<OperationMetaV2> = if !applied {
+        vec![]
+    } else if !record.op_results.is_empty() {
+        let mut ops = vec![];
+        for changed in &record.op_changes {
+            let mut list = vec![];
+            for c in changed.iter().filter(|c| accounts.iter().all(|a| a.key != c.key)) {
+                list.extend(changes(&Touched { key: c.key.clone(), before: c.before.clone(), after: c.after.clone() }, apply_ledger)?);
+            }
+            ops.push(OperationMetaV2 { ext: ExtensionPoint::V0, changes: LedgerEntryChanges(list.try_into()?), events: Default::default() });
+        }
+        ops
+    } else {
+        vec![OperationMetaV2 { ext: ExtensionPoint::V0, changes: LedgerEntryChanges(op_changes.try_into()?), events: record.events.clone().try_into()? }]
+    };
+    let soroban = record.op_results.is_empty();
     let return_value = match &record.status {
         TxStatus::Applied { value } => Some(value.clone()),
         _ => None,
@@ -155,18 +216,9 @@ pub fn meta(record: &TxRecord, accounts: &[Touched], footprint: &[Touched], appl
     Ok(TransactionMeta::V4(TransactionMetaV4 {
         ext: ExtensionPoint::V0,
         tx_changes_before: LedgerEntryChanges(before_changes.try_into()?),
-        operations: if applied {
-            vec![OperationMetaV2 {
-                ext: ExtensionPoint::V0,
-                changes: LedgerEntryChanges(op_changes.try_into()?),
-                events: record.events.clone().try_into()?,
-            }]
-            .try_into()?
-        } else {
-            Default::default()
-        },
+        operations: operations.try_into()?,
         tx_changes_after: LedgerEntryChanges(Default::default()),
-        soroban_meta: Some(SorobanTransactionMetaV2 {
+        soroban_meta: soroban.then_some(SorobanTransactionMetaV2 {
             ext: SorobanTransactionMetaExt::V1(SorobanTransactionMetaExtV1 {
                 ext: ExtensionPoint::V0,
                 total_non_refundable_resource_fee_charged: record.fees.non_refundable,
