@@ -68,7 +68,7 @@ fn snapshot(dir: &Path, passphrase: &str) -> PathBuf {
     });
     let fork = ForkPoint { ledger_seq: FORK_LEDGER, close_time: FORK_TIME, protocol_version: host_protocol(), base_reserve: 5_000_000, base_fee: 100 };
     let path = dir.join("base.snapshot.json");
-    SnapshotFile::new(passphrase, &fork, &entries).unwrap().save(&path).unwrap();
+    SnapshotFile::new(passphrase, &fork, None, &entries).unwrap().save(&path).unwrap();
     path
 }
 
@@ -487,4 +487,140 @@ fn json_rpc_over_http() {
     assert_eq!(status(ureq::post(&url).set("content-type", "application/json; charset=utf-8").set("origin", "http://evil.example").send_string(body)), 403);
     assert_eq!(status(ureq::get(&url).set("origin", "http://evil.example").call()), 403);
     assert_eq!(status(ureq::post(&url).set("content-type", "Application/JSON; charset=utf-8").send_string(r#"{"jsonrpc":"2.0","id":1,"method":"getHealth"}"#)), 200);
+}
+
+/// An unsigned classic transaction with a fee of 100 stroops per operation.
+fn classic_tx(source: &Ed25519Key, seq: i64, ops: Vec<OperationBody>) -> Transaction {
+    let PublicKey::PublicKeyTypeEd25519(k) = source.account_id().0;
+    Transaction {
+        source_account: MuxedAccount::Ed25519(k),
+        fee: 100 * ops.len() as u32,
+        seq_num: SequenceNumber(seq),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: ops.into_iter().map(|body| Operation { source_account: None, body }).collect::<Vec<_>>().try_into().unwrap(),
+        ext: TransactionExt::V0,
+    }
+}
+
+fn pay(to: &Ed25519Key, stroops: i64) -> OperationBody {
+    let PublicKey::PublicKeyTypeEd25519(k) = to.account_id().0;
+    OperationBody::Payment(soroban_env_host::xdr::PaymentOp { destination: MuxedAccount::Ed25519(k), asset: Asset::Native, amount: stroops })
+}
+
+fn op_results(xdr: &Value) -> Vec<soroban_env_host::xdr::OperationResult> {
+    match result_code(xdr) {
+        TransactionResultResult::TxSuccess(r) | TransactionResultResult::TxFailed(r) => r.to_vec(),
+        other => panic!("not an operation-level result: {other:?}"),
+    }
+}
+
+#[test]
+fn classic_transactions_and_a_held_ledger() {
+    use soroban_env_host::xdr::{CreateAccountOp, CreateAccountResult, LedgerEntryChange, OperationResult, OperationResultTr, PaymentResult, SetOptionsOp, Signer, SignerKey};
+    let (mut f, _dir) = facade("classic", TESTNET_PASSPHRASE, false);
+    substitute_alice(&mut f);
+    let (carol, backup, nobody) = (Ed25519Key::throwaway("carol"), Ed25519Key::throwaway("carol backup"), Ed25519Key::throwaway("nobody"));
+
+    // CreateAccount through sendTransaction: core's result and a V4 meta
+    // whose operation created the account.
+    let seq = account_seq(&mut f, &alice()) + 1;
+    let create = classic_tx(&alice(), seq, vec![OperationBody::CreateAccount(CreateAccountOp { destination: carol.account_id(), starting_balance: 50 * 10_000_000 })]);
+    let sent = ok(&mut f, "sendTransaction", json!({ "transaction": signed(&create, TESTNET_PASSPHRASE, &[&alice_throwaway()]) }));
+    assert_eq!(sent["status"], "PENDING", "{sent}");
+    let got = ok(&mut f, "getTransaction", json!({ "hash": sent["hash"] }));
+    assert_eq!(got["status"], "SUCCESS", "{got}");
+    assert_eq!(op_results(&got["resultXdr"]), vec![OperationResult::OpInner(OperationResultTr::CreateAccount(CreateAccountResult::Success))]);
+    let TransactionMeta::V4(meta) = TransactionMeta::from_xdr_base64(got["resultMetaXdr"].as_str().unwrap(), Limits::none()).unwrap() else { panic!("meta is not V4") };
+    assert!(meta.soroban_meta.is_none(), "a classic transaction has no Soroban meta");
+    assert!(meta.operations[0].changes.0.iter().any(|c| matches!(c, LedgerEntryChange::Created(e) if matches!(&e.data, LedgerEntryData::Account(a) if a.account_id == carol.account_id()))));
+    assert_eq!(account_seq(&mut f, &carol), ((FORK_LEDGER + 1) as i64) << 32);
+
+    // Hold the next ledger: carol adds a co-signer while alice pays her.
+    let held = ok(&mut f, "fork_holdLedger", json!({}));
+    let ledger = held["next"]["ledger"].as_u64().unwrap();
+    let cosign = classic_tx(&carol, account_seq(&mut f, &carol) + 1, vec![OperationBody::SetOptions(SetOptionsOp {
+        inflation_dest: None,
+        clear_flags: None,
+        set_flags: None,
+        master_weight: None,
+        low_threshold: Some(1),
+        med_threshold: Some(2),
+        high_threshold: Some(2),
+        home_domain: None,
+        signer: Some(Signer { key: SignerKey::Ed25519(Uint256(backup.public_key())), weight: 1 }),
+    })]);
+    let alice_seq = account_seq(&mut f, &alice());
+    let a = ok(&mut f, "sendTransaction", json!({ "transaction": signed(&cosign, TESTNET_PASSPHRASE, &[&carol]) }));
+    let b = ok(&mut f, "sendTransaction", json!({ "transaction": signed(&classic_tx(&alice(), alice_seq + 1, vec![pay(&carol, 10_000_000)]), TESTNET_PASSPHRASE, &[&alice_throwaway()]) }));
+    assert_eq!((a["status"].as_str(), b["status"].as_str()), (Some("PENDING"), Some("PENDING")));
+    // core's queue holds one transaction per source account.
+    let again = ok(&mut f, "sendTransaction", json!({ "transaction": signed(&classic_tx(&alice(), alice_seq + 2, vec![pay(&carol, 1)]), TESTNET_PASSPHRASE, &[&alice_throwaway()]) }));
+    assert_eq!(again["status"], "TRY_AGAIN_LATER");
+    let older = ok(&mut f, "sendTransaction", json!({ "transaction": signed(&classic_tx(&alice(), alice_seq, vec![pay(&carol, 1)]), TESTNET_PASSPHRASE, &[&alice_throwaway()]) }));
+    assert_eq!(older["status"], "ERROR", "an older sequence number is txBAD_SEQ, as core's queue says");
+    assert!(matches!(result_code(&older["errorResultXdr"]), TransactionResultResult::TxBadSeq));
+    assert_eq!(ok(&mut f, "getTransaction", json!({ "hash": a["hash"] }))["status"], "NOT_FOUND", "still waiting in the held ledger");
+    assert_eq!(f.call("fork_advanceLedgers", json!({ "ledgers": 1 })).unwrap_err().code, RpcError::INVALID_PARAMS);
+    assert_eq!(ok(&mut f, "fork_info", json!({}))["held"]["transactions"].as_array().unwrap().len(), 2);
+
+    let closed = ok(&mut f, "fork_closeLedger", json!({}));
+    let lines = closed["transactions"].as_array().unwrap();
+    assert_eq!(lines.len(), 2, "{closed}");
+    let mut orders: Vec<u64> = lines.iter().map(|l| l["applicationOrder"].as_u64().unwrap()).collect();
+    orders.sort();
+    assert_eq!(orders, vec![1, 2]);
+    for (sent, line) in [&a, &b].iter().zip(lines) {
+        assert_eq!(line["hash"], sent["hash"]);
+        assert_eq!((line["status"].as_str(), line["ledger"].as_u64()), (Some("SUCCESS"), Some(ledger)), "{line}");
+        let got = ok(&mut f, "getTransaction", json!({ "hash": sent["hash"] }));
+        assert_eq!((got["status"].as_str(), got["ledger"].as_u64()), (Some("SUCCESS"), Some(ledger)));
+        assert_eq!(got["applicationOrder"], line["applicationOrder"]);
+    }
+    assert_eq!(ok(&mut f, "getLatestLedger", json!({}))["sequence"].as_u64(), Some(ledger), "one ledger for both");
+    assert!(f.call("fork_closeLedger", json!({})).is_err(), "nothing is held now");
+
+    // The co-signer's thresholds now apply: carol's master alone is short.
+    let short = classic_tx(&carol, account_seq(&mut f, &carol) + 1, vec![pay(&alice(), 1)]);
+    let sent = ok(&mut f, "sendTransaction", json!({ "transaction": signed(&short, TESTNET_PASSPHRASE, &[&carol]) }));
+    assert_eq!(sent["status"], "ERROR");
+    assert_eq!(op_results(&sent["errorResultXdr"]), vec![OperationResult::OpBadAuth]);
+    let sent = ok(&mut f, "sendTransaction", json!({ "transaction": signed(&short, TESTNET_PASSPHRASE, &[&carol, &backup]) }));
+    assert_eq!(ok(&mut f, "getTransaction", json!({ "hash": sent["hash"] }))["status"], "SUCCESS");
+
+    // A fee bump: alice pays carol's payment. getTransaction says so, and
+    // the result is core's txFEE_BUMP_INNER_SUCCESS.
+    {
+        use soroban_env_host::xdr::{FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt, FeeBumpTransactionInnerTx};
+        let inner = classic_tx(&carol, account_seq(&mut f, &carol) + 1, vec![pay(&alice(), 1)]);
+        let hash = transaction_hash(&inner, network_id(TESTNET_PASSPHRASE)).unwrap();
+        let inner = TransactionV1Envelope { tx: inner, signatures: vec![carol.sign_decorated(&hash), backup.sign_decorated(&hash)].try_into().unwrap() };
+        let PublicKey::PublicKeyTypeEd25519(payer) = alice().account_id().0;
+        let bump = FeeBumpTransaction { fee_source: MuxedAccount::Ed25519(payer), fee: 200, inner_tx: FeeBumpTransactionInnerTx::Tx(inner), ext: FeeBumpTransactionExt::V0 };
+        let outer = soroban_sim_core::session::fee_bump_hash(&bump, network_id(TESTNET_PASSPHRASE)).unwrap();
+        let envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope { tx: bump, signatures: vec![alice_throwaway().sign_decorated(&outer)].try_into().unwrap() });
+        let sent = ok(&mut f, "sendTransaction", json!({ "transaction": b64(&envelope) }));
+        let got = ok(&mut f, "getTransaction", json!({ "hash": sent["hash"] }));
+        assert_eq!((got["status"].as_str(), got["feeBump"].as_bool()), (Some("SUCCESS"), Some(true)), "{got}");
+        assert!(matches!(result_code(&got["resultXdr"]), TransactionResultResult::TxFeeBumpInnerSuccess(_)));
+    }
+
+    // An apply-time failure carries core's operation code and pays the fee.
+    let lost = classic_tx(&alice(), account_seq(&mut f, &alice()) + 1, vec![pay(&nobody, 1)]);
+    let sent = ok(&mut f, "sendTransaction", json!({ "transaction": signed(&lost, TESTNET_PASSPHRASE, &[&alice_throwaway()]) }));
+    let got = ok(&mut f, "getTransaction", json!({ "hash": sent["hash"] }));
+    assert_eq!(got["status"], "FAILED");
+    assert_eq!(op_results(&got["resultXdr"]), vec![OperationResult::OpInner(OperationResultTr::Payment(PaymentResult::NoDestination))]);
+
+    // The report lists carol's new signer and thresholds, made by real
+    // transactions rather than overrides.
+    let report = ok(&mut f, "fork_report", json!({}));
+    let accounts = report["report"]["accounts"].as_array().unwrap();
+    let c = accounts.iter().find(|a| a["account"] == carol.strkey()).expect("carol in the report");
+    let changes = c["changes"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect::<Vec<_>>().join("; ");
+    assert!(changes.contains("signer") && changes.contains("added") && changes.contains("thresholds (master/low/medium/high) 1/0/0/0 → 1/1/2/2"), "{changes}");
+    assert_eq!(c["overridden"], false);
+    assert_eq!(report["report"]["overrides"].as_array().unwrap().len(), 1, "only alice's key substitution");
+    let steps = report["report"]["steps"].as_array().unwrap();
+    assert!(steps.iter().any(|s| s["detail"].as_str().unwrap().contains("PAYMENT_NO_DESTINATION")));
 }

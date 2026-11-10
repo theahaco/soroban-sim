@@ -77,9 +77,9 @@ session worker (session-worker.ts)
   The call returns `needs-state` with the keys. `SorobanSession` fetches them
   with `getLedgerEntries` (`ReadOnlyRpc` can call only read methods, and backs
   off on 429), `provide`s them, and repeats the same call. Opening a session
-  asks for all ten network settings at once, and a `sendTransaction` asks
-  for every key its envelope names (source, auth accounts, footprint) in one
-  round. Simulations discover keys as they run, like `simulate` does.
+  asks for all sixteen network settings at once, and a `sendTransaction`
+  asks for every key its envelope names (source, auth accounts, footprint,
+  what its classic operations touch) in one round. Simulations discover keys as they run, like `simulate` does.
 - **A session is a log.** Every JSON-RPC body that changed the session is
   appended to IndexedDB after the session answered it. So is every base batch
   the session read. Resuming forks the same ledger again, hands the component
@@ -146,14 +146,16 @@ The browser runs plans that need no native signer adapter:
 
 - `ed25519` keys (throwaway, by label: the same addresses as the CLI);
 - `classic` signers, single or multi-key;
-- every step kind except `view` with `fresh_fork`;
+- every contract, clock and override step kind except `view` with
+  `fresh_fork` (classic-operation and `ledger` steps run in the CLI only);
 - `vars` with `sha256`, `contract_id`, `ledger_plus` and `view`; `${…}`
   interpolation; `expect` (`equals`, `value`, `fails`) and `save`;
 - `upload` by attached `file` (matched by file name) or by `hash`.
 
 Plans with OpenZeppelin, external (secp256r1, WebAuthn), delegated or
-address-bound classic signers are refused at import, with a pointer to
-`soroban-sim session run`. `examples/session/two-step-add.yaml` runs in both:
+address-bound classic signers, or with `create_account`, `payment`,
+`set_options`, `change_trust`, `operations` or `ledger` steps, are refused at
+import, with a pointer to `soroban-sim session run`. `examples/session/two-step-add.yaml` runs in both:
 the CLI test and the browser test derive the same contract from it over the
 same recorded fork.
 

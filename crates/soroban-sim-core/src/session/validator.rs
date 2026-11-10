@@ -1,9 +1,16 @@
 //! Transaction-level validity: the subset of stellar-core's `TransactionFrame`
-//! and `FeeBumpTransactionFrame` checks a Soroban transaction meets before it
-//! may apply, in core's order. The host never sees the envelope, so everything
-//! here is ours: preconditions, sequence number, envelope signatures against
-//! signer weights and thresholds (ported from core's `SignatureChecker`), fee
-//! bid, resource fee and limits, and the fee source's balance above its reserve.
+//! and `FeeBumpTransactionFrame` checks a transaction meets before it may
+//! apply, in core's order. The host never sees the envelope, so everything
+//! here is ours: preconditions, sequence number, frozen keys (CAP-77),
+//! envelope signatures against signer weights and thresholds (ported from
+//! core's `SignatureChecker`), fee bid, resource fee and limits, the fee
+//! source's balance above its reserve, and for classic transactions each
+//! operation's signatures and well-formedness.
+//!
+//! A ledger close validates twice, as core does: once when the transaction
+//! set is built ([`TxValidator::applying`] false: the fee bid must be on
+//! hand), and again when the transaction applies, against the ledger as the
+//! transactions before it left it (the fee is then already charged).
 
 use anyhow::{anyhow, Result};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -15,9 +22,9 @@ use soroban_env_host::xdr::{
     AccountId, AlphaNum12, AlphaNum4, Asset, ConfigSettingEntry, ConfigSettingId, ContractIdPreimage,
     DecoratedSignature, FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionInnerTx, Hash,
     HostFunction, InvokeHostFunctionOp, LedgerEntryData, LedgerKey, LedgerKeyConfigSetting, Limits, Memo,
-    MuxedAccount, OperationBody, Preconditions, PublicKey, ScAddress, ScMap, ScVal, Signer, SignerKey,
+    MuxedAccount, OperationBody, OperationResult, Preconditions, PublicKey, ReadXdr, ScAddress, ScMap, ScVal, Signer, SignerKey,
     SignerKeyEd25519SignedPayload, SorobanAuthorizationEntry, SorobanCredentials, SorobanDelegateSignature,
-    SorobanTransactionData, SorobanTransactionDataExt, Transaction, TransactionEnvelope,
+    SorobanTransactionData, SorobanTransactionDataExt, Transaction, TransactionEnvelope, TransactionExt,
     TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction, TransactionV0, TransactionV1Envelope,
     TrustLineAsset, Uint256, WriteXdr,
 };
@@ -26,7 +33,8 @@ use soroban_simulation::NetworkConfig;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use super::ledger::{is_persistent_key, ForkedLedger};
+use super::classic;
+use super::ledger::{account_key, is_persistent_key, ForkedLedger};
 use super::signers::auth_payload;
 
 /// Why an envelope was refused before it could apply. Rejected envelopes are
@@ -46,10 +54,15 @@ pub enum TxCode {
     OpBadAuth,
     /// The operation itself is invalid (`txFAILED` with `..._MALFORMED`).
     OpMalformed,
+    /// A classic operation is malformed or its source is missing (`txFAILED`;
+    /// the rejection's `op_results` say which and why).
+    OpFailed,
     BadAuthExtra,
     InsufficientFee,
     InsufficientBalance,
     SorobanInvalid,
+    /// The transaction reads or writes a key the network froze (CAP-77).
+    FrozenKeyAccessed,
 }
 
 impl TxCode {
@@ -67,10 +80,12 @@ impl TxCode {
             Self::BadAuth => "txBAD_AUTH",
             Self::OpBadAuth => "txFAILED(opBAD_AUTH)",
             Self::OpMalformed => "txFAILED(opMALFORMED)",
+            Self::OpFailed => "txFAILED",
             Self::BadAuthExtra => "txBAD_AUTH_EXTRA",
             Self::InsufficientFee => "txINSUFFICIENT_FEE",
             Self::InsufficientBalance => "txINSUFFICIENT_BALANCE",
             Self::SorobanInvalid => "txSOROBAN_INVALID",
+            Self::FrozenKeyAccessed => "txFROZEN_KEY_ACCESSED",
         }
     }
 }
@@ -82,6 +97,9 @@ pub struct Rejection {
     /// The inner transaction of a fee bump was refused (`txFEE_BUMP_INNER_FAILED`
     /// with `code` inside).
     pub fee_bump_inner: bool,
+    /// For `txFAILED` on a classic transaction: every operation's result,
+    /// the failing ones with their codes.
+    pub op_results: Vec<OperationResult>,
 }
 
 pub fn rejection_code(code: TxCode, fee_bump_inner: bool) -> String {
@@ -93,7 +111,55 @@ pub fn rejection_code(code: TxCode, fee_bump_inner: bool) -> String {
 }
 
 fn reject<T>(code: TxCode, detail: impl Into<String>) -> Result<std::result::Result<T, Rejection>> {
-    Ok(Err(Rejection { code, detail: detail.into(), fee_bump_inner: false }))
+    Ok(Err(Rejection { code, detail: detail.into(), fee_bump_inner: false, op_results: vec![] }))
+}
+
+fn refusal(code: TxCode, detail: String) -> Option<Rejection> {
+    Some(Rejection { code, detail, fee_bump_inner: false, op_results: vec![] })
+}
+
+/// The ledger keys the network froze (CAP-77) and the transactions allowed
+/// to touch them anyway, from the `ConfigSetting` entries. A transaction whose
+/// source, footprint or operations touch a frozen key is refused.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FrozenKeys {
+    pub keys: BTreeSet<LedgerKey>,
+    pub bypass_txs: BTreeSet<[u8; 32]>,
+}
+
+impl FrozenKeys {
+    /// Missing entries (a snapshot or a network from before CAP-77) read as
+    /// nothing frozen.
+    pub fn load_from_snapshot(snapshot: &impl SnapshotSource) -> Result<Self> {
+        let get = |id: ConfigSettingId| -> Result<Option<ConfigSettingEntry>> {
+            let key = Rc::new(LedgerKey::ConfigSetting(LedgerKeyConfigSetting { config_setting_id: id }));
+            Ok(match snapshot.get(&key).map_err(|e| anyhow!("reading {id:?}: {e:?}"))? {
+                Some((entry, _)) => match &entry.data {
+                    LedgerEntryData::ConfigSetting(cs) => Some(cs.clone()),
+                    _ => None,
+                },
+                None => None,
+            })
+        };
+        let mut out = Self::default();
+        if let Some(ConfigSettingEntry::FrozenLedgerKeys(f)) = get(ConfigSettingId::FrozenLedgerKeys)? {
+            for k in f.keys.iter() {
+                out.keys.insert(LedgerKey::from_xdr(k.0.as_slice(), Limits::none()).map_err(|e| anyhow!("a frozen ledger key does not decode: {e}"))?);
+            }
+        }
+        if let Some(ConfigSettingEntry::FreezeBypassTxs(b)) = get(ConfigSettingId::FreezeBypassTxs)? {
+            out.bypass_txs = b.tx_hashes.iter().map(|h| h.0).collect();
+        }
+        Ok(out)
+    }
+
+    /// The first of `keys` that is frozen, unless `tx_hash` may bypass.
+    pub fn hit<'k>(&self, keys: impl IntoIterator<Item = &'k LedgerKey>, tx_hash: &[u8; 32]) -> Option<&'k LedgerKey> {
+        if self.keys.is_empty() || self.bypass_txs.contains(tx_hash) {
+            return None;
+        }
+        keys.into_iter().find(|k| self.keys.contains(*k))
+    }
 }
 
 /// Per-transaction network maxima, read from the `ConfigSetting` entries.
@@ -254,6 +320,178 @@ pub struct ValidTx {
     pub replayable: Vec<String>,
 }
 
+/// One operation of a classic transaction, with its source resolved.
+#[derive(Clone, Debug)]
+pub struct ClassicOp {
+    pub source: AccountId,
+    pub body: OperationBody,
+}
+
+/// A classic transaction that passed every transaction-level check.
+#[derive(Clone, Debug)]
+pub struct ValidClassicTx {
+    /// The envelope's hash: the outer hash for a fee bump.
+    pub hash: [u8; 32],
+    /// The inner transaction's hash, for a fee bump.
+    pub inner_hash: Option<[u8; 32]>,
+    pub source: AccountId,
+    /// Pays the fee: the fee-bump source, or `source`.
+    pub fee_source: AccountId,
+    /// The transaction's sequence number: the source's sequence after apply.
+    pub seq_num: i64,
+    pub ops: Vec<ClassicOp>,
+    /// No resource fee: the inclusion fee is all of it.
+    pub fees: Fees,
+    pub size_bytes: u32,
+    pub signers: Vec<MatchedSigner>,
+    pub replayable: Vec<String>,
+}
+
+/// A valid envelope, Soroban or classic.
+#[derive(Clone, Debug)]
+pub enum Valid {
+    Soroban(Box<ValidTx>),
+    Classic(Box<ValidClassicTx>),
+}
+
+impl Valid {
+    pub fn hash(&self) -> [u8; 32] {
+        match self {
+            Self::Soroban(v) => v.hash,
+            Self::Classic(v) => v.hash,
+        }
+    }
+
+    /// The transaction hash of a fee bump's inner transaction.
+    pub fn inner_hash(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Soroban(v) => v.inner_hash,
+            Self::Classic(v) => v.inner_hash,
+        }
+    }
+
+    pub fn source(&self) -> &AccountId {
+        match self {
+            Self::Soroban(v) => &v.source,
+            Self::Classic(v) => &v.source,
+        }
+    }
+
+    /// Who pays the fee and gets the refund.
+    pub fn fee_source(&self) -> &AccountId {
+        match self {
+            Self::Soroban(v) => &v.fee_source,
+            Self::Classic(v) => &v.fee_source,
+        }
+    }
+
+    pub fn seq_num(&self) -> i64 {
+        match self {
+            Self::Soroban(v) => v.seq_num,
+            Self::Classic(v) => v.seq_num,
+        }
+    }
+
+    pub fn fees(&self) -> &Fees {
+        match self {
+            Self::Soroban(v) => &v.fees,
+            Self::Classic(v) => &v.fees,
+        }
+    }
+
+    pub fn signers(&self) -> &[MatchedSigner] {
+        match self {
+            Self::Soroban(v) => &v.signers,
+            Self::Classic(v) => &v.signers,
+        }
+    }
+
+    pub fn replayable(&self) -> &[String] {
+        match self {
+            Self::Soroban(v) => &v.replayable,
+            Self::Classic(v) => &v.replayable,
+        }
+    }
+
+    pub fn size_bytes(&self) -> u32 {
+        match self {
+            Self::Soroban(v) => v.size_bytes,
+            Self::Classic(v) => v.size_bytes,
+        }
+    }
+
+    pub fn is_soroban(&self) -> bool {
+        matches!(self, Self::Soroban(_))
+    }
+
+    /// The operations' sources besides the transaction's: a pre-auth signer
+    /// for the transaction is spent on each of them.
+    pub fn op_sources(&self) -> Vec<AccountId> {
+        let mut out: Vec<AccountId> = vec![];
+        let mut push = |id: &AccountId| {
+            if id != self.source() && !out.contains(id) {
+                out.push(id.clone());
+            }
+        };
+        match self {
+            Self::Soroban(v) => push(&v.op_source),
+            Self::Classic(v) => v.ops.iter().for_each(|op| push(&op.source)),
+        }
+        out
+    }
+
+    /// Every ledger key the transaction may change or reads to decide its
+    /// result, the source account first (then the fee source): a Soroban
+    /// footprint, or what each classic operation touches.
+    pub fn touched_keys(&self) -> Vec<LedgerKey> {
+        let mut keys = vec![account_key(self.source())];
+        let mut push = |k: LedgerKey| {
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        };
+        push(account_key(self.fee_source()));
+        match self {
+            Self::Soroban(v) => v.data.resources.footprint.read_only.iter().chain(v.data.resources.footprint.read_write.iter()).cloned().for_each(&mut push),
+            Self::Classic(v) => {
+                for op in &v.ops {
+                    push(account_key(&op.source));
+                    classic::op_keys(&op.body, &op.source).into_iter().for_each(&mut push);
+                }
+            }
+        }
+        keys
+    }
+
+    /// Wrap a fee bump around this inner transaction.
+    #[allow(clippy::too_many_arguments)]
+    fn fee_bumped(self, hash: [u8; 32], fee_source: AccountId, bid: i64, inclusion: i64, mut signers: Vec<MatchedSigner>, mut replayable: Vec<String>) -> Self {
+        macro_rules! wrap {
+            ($v:expr) => {{
+                replayable.append(&mut $v.replayable);
+                signers.append(&mut $v.signers);
+                $v.inner_hash = Some($v.hash);
+                $v.hash = hash;
+                $v.fee_source = fee_source;
+                $v.fees.bid = bid;
+                $v.fees.inclusion = inclusion;
+                $v.signers = signers;
+                $v.replayable = replayable;
+            }};
+        }
+        match self {
+            Self::Soroban(mut v) => {
+                wrap!(v);
+                Self::Soroban(v)
+            }
+            Self::Classic(mut v) => {
+                wrap!(v);
+                Self::Classic(v)
+            }
+        }
+    }
+}
+
 pub struct TxValidator<'a> {
     pub ledger: &'a ForkedLedger,
     pub info: &'a LedgerInfo,
@@ -265,6 +503,11 @@ pub struct TxValidator<'a> {
     /// unless the lane is surge priced; `i64::MAX` charges the full bid (a
     /// transaction-set component without a base fee). `None`: the base fee.
     pub lane_base_fee: Option<i64>,
+    pub frozen: &'a FrozenKeys,
+    /// Validating at apply time: the fee is already charged, so the fee
+    /// source only has to stay at or above its reserve, and operations are
+    /// checked against the ledger the earlier transactions of the ledger left.
+    pub applying: bool,
 }
 
 /// The hash every envelope signature signs.
@@ -345,11 +588,26 @@ pub fn muxed_account_id(m: &MuxedAccount) -> AccountId {
 impl TxValidator<'_> {
     /// `Ok(Err(_))` is a rejection; `Err(_)` is an infrastructure failure
     /// (the base ledger could not be read).
-    pub fn validate(&self, envelope: &TransactionEnvelope) -> Result<std::result::Result<ValidTx, Rejection>> {
+    pub fn validate(&self, envelope: &TransactionEnvelope) -> Result<std::result::Result<Valid, Rejection>> {
         match envelope {
-            TransactionEnvelope::Tx(e) => self.validate_tx(e, true),
+            TransactionEnvelope::Tx(e) => self.validate_tx(e, None),
             TransactionEnvelope::TxFeeBump(e) => self.validate_fee_bump(e),
             TransactionEnvelope::TxV0(_) => reject(TxCode::NotSupported, "v0 envelopes are not valid since protocol 13"),
+        }
+    }
+
+    /// The checks core repeats when a transaction applies (`commonValid` in
+    /// `commonPreApply`). A fee bump's outer checks are not repeated: core
+    /// spends the fee source's pre-auth signer and applies the inner
+    /// transaction, whose own fee is not checked.
+    pub fn validate_at_apply(&self, envelope: &TransactionEnvelope) -> Result<std::result::Result<(), Rejection>> {
+        match envelope {
+            TransactionEnvelope::TxFeeBump(e) => {
+                let FeeBumpTransactionInnerTx::Tx(inner) = &e.tx.inner_tx;
+                let hash = fee_bump_hash(&e.tx, self.info.network_id)?;
+                Ok(self.validate_tx(inner, Some(hash))?.map(|_| ()).map_err(|r| Rejection { fee_bump_inner: true, ..r }))
+            }
+            other => Ok(self.validate(other)?.map(|_| ())),
         }
     }
 
@@ -358,31 +616,42 @@ impl TxValidator<'_> {
         self.lane_base_fee.unwrap_or(self.base_fee as i64)
     }
 
+    /// A v1 envelope: Soroban or classic, by its operations. `fee_bump` is
+    /// the outer hash when this is a fee bump's inner transaction: its own fee
+    /// is then not charged, and the outer hash is what may bypass frozen keys.
+    fn validate_tx(&self, envelope: &TransactionV1Envelope, fee_bump: Option<[u8; 32]>) -> Result<std::result::Result<Valid, Rejection>> {
+        Ok(match soroban_data(&envelope.tx) {
+            SorobanData::Classic => self.validate_classic(envelope, fee_bump)?.map(|v| Valid::Classic(Box::new(v))),
+            _ => self.validate_soroban(envelope, fee_bump)?.map(|v| Valid::Soroban(Box::new(v))),
+        })
+    }
+
     /// core's `FeeBumpTransactionFrame::checkValid`: the outer fee and its rate
-    /// against the inner transaction's, the fee source's signatures and
-    /// balance, then the inner transaction without charging it a fee.
-    fn validate_fee_bump(&self, e: &FeeBumpTransactionEnvelope) -> Result<std::result::Result<ValidTx, Rejection>> {
+    /// against the inner transaction's, the fee source's signatures, balance
+    /// and frozen state, then the inner transaction without charging it a fee.
+    fn validate_fee_bump(&self, e: &FeeBumpTransactionEnvelope) -> Result<std::result::Result<Valid, Rejection>> {
         let FeeBumpTransactionInnerTx::Tx(inner) = &e.tx.inner_tx;
         let hash = fee_bump_hash(&e.tx, self.info.network_id)?;
-        let SorobanData::Found(data) = soroban_data(&inner.tx) else {
-            return reject(TxCode::NotSupported, "only Soroban transactions are supported");
+        let resource_fee = match soroban_data(&inner.tx) {
+            SorobanData::Found(data) => data.resource_fee,
+            SorobanData::Missing | SorobanData::Classic => 0,
         };
-        if e.tx.fee < 0 || data.resource_fee < 0 {
+        if e.tx.fee < 0 || resource_fee < 0 {
             return reject(TxCode::Malformed, "negative fee");
         }
         let ops = inner.tx.operations.len().max(1) as i64;
         let base = self.base_fee as i64;
-        let inclusion_bid = e.tx.fee - data.resource_fee;
+        let inclusion_bid = e.tx.fee - resource_fee;
         let min_inclusion = base.saturating_mul(ops + 1);
         if inclusion_bid < min_inclusion {
             return reject(
                 TxCode::InsufficientFee,
-                format!("fee bump {} leaves {inclusion_bid} for inclusion after the {} resource fee; the minimum is {min_inclusion}", e.tx.fee, data.resource_fee),
+                format!("fee bump {} leaves {inclusion_bid} for inclusion after the {resource_fee} resource fee; the minimum is {min_inclusion}", e.tx.fee),
             );
         }
         // The fee bump must raise the inclusion fee rate (a non-positive inner
         // inclusion fee is allowed for Soroban since protocol 23).
-        let inner_inclusion = inner.tx.fee as i64 - data.resource_fee;
+        let inner_inclusion = inner.tx.fee as i64 - resource_fee;
         if inner_inclusion >= 0 && (inclusion_bid as i128) * ((base * ops) as i128) < (inner_inclusion as i128) * (min_inclusion as i128) {
             return reject(TxCode::InsufficientFee, format!("the fee bump's inclusion fee rate {inclusion_bid}/{} is below the inner transaction's {inner_inclusion}/{ops}", ops + 1));
         }
@@ -395,45 +664,36 @@ impl TxValidator<'_> {
         if !checker.check(&fee_source, &account_signers(&fee_account), low) {
             return reject(TxCode::BadAuth, threshold_miss(&fee_source, "low", low));
         }
-        let available = available_balance(&fee_account, self.info.base_reserve);
-        if available < e.tx.fee {
-            return reject(
-                TxCode::InsufficientBalance,
-                format!("fee bid {} XLM, fee source available {} XLM above the reserve", xlm(e.tx.fee), xlm(available)),
-            );
+        if let Some(r) = self.check_balance(&fee_account, e.tx.fee, "fee source ") {
+            return Ok(Err(r));
+        }
+        if let Some(r) = self.check_frozen(std::iter::once(&account_key(&fee_source)), &hash) {
+            return Ok(Err(r));
         }
         if let Some(unused) = checker.unused() {
             return reject(TxCode::BadAuthExtra, format!("fee-bump signature {unused} matches no signer that was needed"));
         }
-        let mut valid = match self.validate_tx(inner, false)? {
+        let valid = match self.validate_tx(inner, Some(hash))? {
             Ok(v) => v,
             Err(r) => return Ok(Err(Rejection { detail: format!("fee-bump inner transaction: {}", r.detail), fee_bump_inner: true, ..r })),
         };
-        let mut replayable = self.replayable(&checker.matched)?;
-        replayable.append(&mut valid.replayable);
-        let mut signers = checker.matched;
-        signers.append(&mut valid.signers);
-        valid.inner_hash = Some(valid.hash);
-        valid.hash = hash;
-        valid.fee_source = fee_source;
-        valid.fees.bid = e.tx.fee;
-        valid.fees.inclusion = inclusion_bid.min(self.lane_fee().saturating_mul(ops + 1));
-        valid.signers = signers;
-        valid.replayable = replayable;
-        Ok(Ok(valid))
+        let replayable = self.replayable(&checker.matched)?;
+        let inclusion = inclusion_bid.min(self.lane_fee().saturating_mul(ops + 1));
+        Ok(Ok(valid.fee_bumped(hash, fee_source, e.tx.fee, inclusion, checker.matched, replayable)))
     }
 
     /// core's `TransactionFrame::checkValid` for one Soroban transaction, in
-    /// core's order. `charge_fee` is false for a fee bump's inner transaction:
-    /// its own fee bid and its source's balance are then not checked.
-    fn validate_tx(&self, envelope: &TransactionV1Envelope, charge_fee: bool) -> Result<std::result::Result<ValidTx, Rejection>> {
+    /// core's order. For a fee bump's inner transaction (`fee_bump`) its own
+    /// fee bid and its source's balance are not checked.
+    fn validate_soroban(&self, envelope: &TransactionV1Envelope, fee_bump: Option<[u8; 32]>) -> Result<std::result::Result<ValidTx, Rejection>> {
         let TransactionV1Envelope { tx, signatures } = envelope;
         let hash = transaction_hash(tx, self.info.network_id)?;
+        let charge_fee = fee_bump.is_none();
         let size_bytes = TransactionEnvelope::Tx(envelope.clone()).to_xdr(Limits::none())?.len() as u32;
         let data = match soroban_data(tx) {
             SorobanData::Found(d) => d,
             SorobanData::Missing => return reject(TxCode::Malformed, "a Soroban transaction must carry SorobanTransactionData"),
-            SorobanData::Classic => return reject(TxCode::NotSupported, "only Soroban transactions are supported (no classic operations yet)"),
+            SorobanData::Classic => unreachable!("classic transactions validate in validate_classic"),
         };
         if data.resource_fee < 0 {
             return reject(TxCode::Malformed, "negative resource fee");
@@ -484,32 +744,8 @@ impl TxValidator<'_> {
         }
 
         // --- preconditions that do not need the account ---
-        let (time_bounds, ledger_bounds) = match &tx.cond {
-            Preconditions::None => (None, None),
-            Preconditions::Time(tb) => (Some(tb), None),
-            Preconditions::V2(p) => (p.time_bounds.as_ref(), p.ledger_bounds.as_ref()),
-        };
-        let now = self.info.timestamp;
-        let seq = self.info.sequence_number;
-        if let Some(tb) = time_bounds {
-            if now < tb.min_time.0 {
-                return reject(TxCode::TooEarly, format!("close time {now} < min time {}", tb.min_time.0));
-            }
-        }
-        if let Some(lb) = ledger_bounds {
-            if seq < lb.min_ledger {
-                return reject(TxCode::TooEarly, format!("ledger {seq} < min ledger {}", lb.min_ledger));
-            }
-        }
-        if let Some(tb) = time_bounds {
-            if tb.max_time.0 != 0 && now > tb.max_time.0 {
-                return reject(TxCode::TooLate, format!("close time {now} > max time {}", tb.max_time.0));
-            }
-        }
-        if let Some(lb) = ledger_bounds {
-            if lb.max_ledger != 0 && lb.max_ledger <= seq {
-                return reject(TxCode::TooLate, format!("ledger {seq} >= max ledger {}", lb.max_ledger));
-            }
+        if let Some(r) = self.check_bounds(tx) {
+            return Ok(Err(r));
         }
 
         // --- the inclusion fee bid ---
@@ -535,30 +771,14 @@ impl TxValidator<'_> {
         let Some(account) = self.ledger.account(&source)? else {
             return reject(TxCode::NoAccount, format!("source account {source} does not exist"));
         };
-        let acct_seq = account.seq_num.0;
-        if tx.seq_num.0 == (seq as i64) << 32 {
-            return reject(TxCode::BadSeq, format!("transaction sequence {} is this ledger's starting sequence number", tx.seq_num.0));
+        let mut frozen_keys = vec![account_key(&source)];
+        frozen_keys.extend(op.source_account.as_ref().map(|s| account_key(&muxed_account_id(s))));
+        frozen_keys.extend(data.resources.footprint.read_only.iter().chain(data.resources.footprint.read_write.iter()).cloned());
+        if let Some(r) = self.check_frozen(frozen_keys.iter(), &fee_bump.unwrap_or(hash)) {
+            return Ok(Err(r));
         }
-        match v2.and_then(|p| p.min_seq_num.as_ref()) {
-            Some(min) => {
-                if acct_seq < min.0 || acct_seq >= tx.seq_num.0 {
-                    return reject(TxCode::BadSeq, format!("account sequence {acct_seq} outside [{}, {})", min.0, tx.seq_num.0));
-                }
-            }
-            None => {
-                if acct_seq == i64::MAX || tx.seq_num.0 != acct_seq + 1 {
-                    return reject(TxCode::BadSeq, format!("transaction sequence {} != account sequence {acct_seq} + 1", tx.seq_num.0));
-                }
-            }
-        }
-        if let Some(p) = v2 {
-            let (seq_ledger, seq_time) = seq_ledger_and_time(&account);
-            if p.min_seq_age.0 > 0 && now.saturating_sub(seq_time) < p.min_seq_age.0 {
-                return reject(TxCode::BadMinSeqAgeOrGap, format!("sequence age {} < {}", now.saturating_sub(seq_time), p.min_seq_age.0));
-            }
-            if p.min_seq_ledger_gap > 0 && seq.saturating_sub(seq_ledger) < p.min_seq_ledger_gap {
-                return reject(TxCode::BadMinSeqAgeOrGap, format!("sequence ledger gap {} < {}", seq.saturating_sub(seq_ledger), p.min_seq_ledger_gap));
-            }
+        if let Some(r) = self.check_seq(tx, &account) {
+            return Ok(Err(r));
         }
 
         let mut checker = SignatureChecker::new(hash, signatures.as_slice());
@@ -574,12 +794,8 @@ impl TxValidator<'_> {
             }
         }
         if charge_fee {
-            let available = available_balance(&account, self.info.base_reserve);
-            if available < fees.bid {
-                return reject(
-                    TxCode::InsufficientBalance,
-                    format!("fee bid {} XLM, available {} XLM above the reserve", xlm(fees.bid), xlm(available)),
-                );
+            if let Some(r) = self.check_balance(&account, fees.bid, "") {
+                return Ok(Err(r));
             }
         }
         // The operation: InvokeHostFunction needs its source's medium threshold.
@@ -622,6 +838,221 @@ impl TxValidator<'_> {
         }))
     }
 
+    /// core's `isTooEarly` then `isTooLate`, on time and ledger bounds.
+    fn check_bounds(&self, tx: &Transaction) -> Option<Rejection> {
+        let (time_bounds, ledger_bounds) = match &tx.cond {
+            Preconditions::None => (None, None),
+            Preconditions::Time(tb) => (Some(tb), None),
+            Preconditions::V2(p) => (p.time_bounds.as_ref(), p.ledger_bounds.as_ref()),
+        };
+        let (now, seq) = (self.info.timestamp, self.info.sequence_number);
+        if let Some(tb) = time_bounds.filter(|tb| now < tb.min_time.0) {
+            return refusal(TxCode::TooEarly, format!("close time {now} < min time {}", tb.min_time.0));
+        }
+        if let Some(lb) = ledger_bounds.filter(|lb| seq < lb.min_ledger) {
+            return refusal(TxCode::TooEarly, format!("ledger {seq} < min ledger {}", lb.min_ledger));
+        }
+        if let Some(tb) = time_bounds.filter(|tb| tb.max_time.0 != 0 && now > tb.max_time.0) {
+            return refusal(TxCode::TooLate, format!("close time {now} > max time {}", tb.max_time.0));
+        }
+        if let Some(lb) = ledger_bounds.filter(|lb| lb.max_ledger != 0 && lb.max_ledger <= seq) {
+            return refusal(TxCode::TooLate, format!("ledger {seq} >= max ledger {}", lb.max_ledger));
+        }
+        None
+    }
+
+    /// CAP-77: refuse a transaction that touches a frozen key, unless the
+    /// network lists it as allowed to.
+    fn check_frozen<'k>(&self, keys: impl IntoIterator<Item = &'k LedgerKey>, hash: &[u8; 32]) -> Option<Rejection> {
+        self.frozen.hit(keys, hash).and_then(|k| refusal(TxCode::FrozenKeyAccessed, format!("the network froze {} {}", k.name(), describe_frozen(k))))
+    }
+
+    /// core's `isBadSeq` and `isTooEarlyForAccount`.
+    fn check_seq(&self, tx: &Transaction, account: &AccountEntry) -> Option<Rejection> {
+        let (now, seq) = (self.info.timestamp, self.info.sequence_number);
+        let v2 = match &tx.cond {
+            Preconditions::V2(p) => Some(p),
+            _ => None,
+        };
+        let acct_seq = account.seq_num.0;
+        if tx.seq_num.0 == (seq as i64) << 32 {
+            return refusal(TxCode::BadSeq, format!("transaction sequence {} is this ledger's starting sequence number", tx.seq_num.0));
+        }
+        match v2.and_then(|p| p.min_seq_num.as_ref()) {
+            Some(min) => {
+                if acct_seq < min.0 || acct_seq >= tx.seq_num.0 {
+                    return refusal(TxCode::BadSeq, format!("account sequence {acct_seq} outside [{}, {})", min.0, tx.seq_num.0));
+                }
+            }
+            None => {
+                if acct_seq == i64::MAX || tx.seq_num.0 != acct_seq + 1 {
+                    return refusal(TxCode::BadSeq, format!("transaction sequence {} != account sequence {acct_seq} + 1", tx.seq_num.0));
+                }
+            }
+        }
+        if let Some(p) = v2 {
+            let (seq_ledger, seq_time) = seq_ledger_and_time(account);
+            if p.min_seq_age.0 > 0 && now.saturating_sub(seq_time) < p.min_seq_age.0 {
+                return refusal(TxCode::BadMinSeqAgeOrGap, format!("sequence age {} < {}", now.saturating_sub(seq_time), p.min_seq_age.0));
+            }
+            if p.min_seq_ledger_gap > 0 && seq.saturating_sub(seq_ledger) < p.min_seq_ledger_gap {
+                return refusal(TxCode::BadMinSeqAgeOrGap, format!("sequence ledger gap {} < {}", seq.saturating_sub(seq_ledger), p.min_seq_ledger_gap));
+            }
+        }
+        None
+    }
+
+    /// The fee bid must be on hand above the reserve when the transaction
+    /// set is built; at apply the fee is already charged, so the payer only
+    /// must not have fallen below its reserve.
+    fn check_balance(&self, account: &AccountEntry, bid: i64, who: &str) -> Option<Rejection> {
+        let available = available_balance(account, self.info.base_reserve);
+        let needed = if self.applying { 0 } else { bid };
+        if available >= needed {
+            return None;
+        }
+        let detail = if self.applying {
+            format!("{who}{} XLM below the reserve after the fee", xlm(-available))
+        } else {
+            format!("fee bid {} XLM, {who}available {} XLM above the reserve", xlm(bid), xlm(available))
+        };
+        refusal(TxCode::InsufficientBalance, detail)
+    }
+
+    /// core's `TransactionFrame::checkValid` for a classic transaction, then
+    /// each operation's signatures and `doCheckValid`. At apply time every
+    /// operation's signatures are checked (its well-formedness is checked as
+    /// it applies); when the set is built the first failing operation decides.
+    /// For a fee bump's inner transaction (`fee_bump`) its own fee bid and
+    /// its source's balance are not checked.
+    fn validate_classic(&self, envelope: &TransactionV1Envelope, fee_bump: Option<[u8; 32]>) -> Result<std::result::Result<ValidClassicTx, Rejection>> {
+        let TransactionV1Envelope { tx, signatures } = envelope;
+        let hash = transaction_hash(tx, self.info.network_id)?;
+        let charge_fee = fee_bump.is_none();
+        let size_bytes = TransactionEnvelope::Tx(envelope.clone()).to_xdr(Limits::none())?.len() as u32;
+        let v2 = match &tx.cond {
+            Preconditions::V2(p) => Some(p),
+            _ => None,
+        };
+        if let Some(p) = v2 {
+            let extra = p.extra_signers.as_slice();
+            if extra.len() == 2 && extra[0] == extra[1] {
+                return reject(TxCode::Malformed, "duplicate extra signers");
+            }
+            if extra.iter().any(|s| matches!(s, SignerKey::Ed25519SignedPayload(p) if p.payload.is_empty())) {
+                return reject(TxCode::Malformed, "an extra signer's signed payload is empty");
+            }
+        }
+        if tx.operations.is_empty() {
+            return reject(TxCode::MissingOperation, "no operations");
+        }
+        if !matches!(tx.ext, TransactionExt::V0) {
+            return reject(TxCode::Malformed, "a classic transaction may not carry Soroban transaction data");
+        }
+        if let Some(op) = tx.operations.iter().find(|op| !classic::is_supported(&op.body)) {
+            return reject(
+                TxCode::NotSupported,
+                format!("{} operations are not modelled (classic: CreateAccount, Payment, SetOptions, ChangeTrust)", op.body.name()),
+            );
+        }
+        if let Some(r) = self.check_bounds(tx) {
+            return Ok(Err(r));
+        }
+        let n_ops = tx.operations.len() as i64;
+        let min_fee = (self.base_fee as i64).saturating_mul(n_ops);
+        if charge_fee && (tx.fee as i64) < min_fee {
+            return reject(TxCode::InsufficientFee, format!("fee bid {} is below {min_fee}, the base fee for {n_ops} operation(s)", tx.fee));
+        }
+        let source = muxed_account_id(&tx.source_account);
+        let Some(account) = self.ledger.account(&source)? else {
+            return reject(TxCode::NoAccount, format!("source account {source} does not exist"));
+        };
+        let ops: Vec<ClassicOp> = tx
+            .operations
+            .iter()
+            .map(|op| ClassicOp { source: op.source_account.as_ref().map(muxed_account_id).unwrap_or_else(|| source.clone()), body: op.body.clone() })
+            .collect();
+        let mut frozen_keys = vec![account_key(&source)];
+        for (op, raw) in ops.iter().zip(tx.operations.iter()) {
+            if raw.source_account.is_some() {
+                frozen_keys.push(account_key(&op.source));
+            }
+            frozen_keys.extend(classic::frozen_check_keys(&op.body, &op.source));
+        }
+        if let Some(r) = self.check_frozen(frozen_keys.iter(), &fee_bump.unwrap_or(hash)) {
+            return Ok(Err(r));
+        }
+        if let Some(r) = self.check_seq(tx, &account) {
+            return Ok(Err(r));
+        }
+
+        let mut checker = SignatureChecker::new(hash, signatures.as_slice());
+        let low = account.thresholds.0[1] as u32;
+        if !checker.check(&source, &account_signers(&account), low) {
+            return reject(TxCode::BadAuth, threshold_miss(&source, "low", low));
+        }
+        if let Some(p) = v2 {
+            for extra in p.extra_signers.iter() {
+                if !checker.check(&source, &[Signer { key: extra.clone(), weight: 1 }], 1) {
+                    return reject(TxCode::BadAuth, format!("extra signer {extra} did not sign"));
+                }
+            }
+        }
+        let bid = tx.fee as i64;
+        let fees = Fees { bid, resource_fee: 0, non_refundable: 0, refundable: 0, inclusion: bid.min(self.lane_fee().saturating_mul(n_ops)) };
+        if charge_fee {
+            if let Some(r) = self.check_balance(&account, bid, "") {
+                return Ok(Err(r));
+            }
+        }
+
+        let mut results: Vec<OperationResult> = ops.iter().map(|op| classic::initial_result(&op.body)).collect();
+        let mut failures = vec![];
+        for (i, op) in ops.iter().enumerate() {
+            let explicit = tx.operations[i].source_account.is_some();
+            let signed = match self.ledger.account(&op.source)? {
+                Some(a) => {
+                    let level = classic::threshold_index(&op.body);
+                    let needed = a.thresholds.0[level] as u32;
+                    checker.check(&op.source, &account_signers(&a), needed).then_some(()).ok_or_else(|| {
+                        (OperationResult::OpBadAuth, threshold_miss(&op.source, if level == 3 { "high" } else { "medium" }, needed))
+                    })
+                }
+                // An operation sourced from an account that does not exist
+                // yet still needs that key's signature.
+                None if explicit => {
+                    let PublicKey::PublicKeyTypeEd25519(k) = &op.source.0;
+                    let master = Signer { key: SignerKey::Ed25519(k.clone()), weight: 1 };
+                    checker.check(&op.source, &[master], 0).then_some(()).ok_or_else(|| (OperationResult::OpBadAuth, format!("{} did not sign", op.source)))
+                }
+                None => Err((OperationResult::OpNoAccount, format!("operation source {} does not exist", op.source))),
+            };
+            let checked = match signed {
+                Ok(()) if !self.applying => match classic::check_valid(&op.body, &op.source) {
+                    Some(r) => Err((r, "malformed".to_string())),
+                    None => Ok(()),
+                },
+                other => other,
+            };
+            if let Err((r, why)) = checked {
+                failures.push(format!("operation {} ({}): {}: {why}", i + 1, op.body.name(), classic::result_name(&r)));
+                results[i] = r;
+                if !self.applying {
+                    break;
+                }
+            }
+        }
+        if !failures.is_empty() {
+            let code = if results.iter().any(|r| matches!(r, OperationResult::OpBadAuth)) { TxCode::OpBadAuth } else { TxCode::OpFailed };
+            return Ok(Err(Rejection { code, detail: failures.join("; "), fee_bump_inner: false, op_results: results }));
+        }
+        if let Some(unused) = checker.unused() {
+            return reject(TxCode::BadAuthExtra, format!("signature {unused} matches no signer that was needed"));
+        }
+        let replayable = self.replayable(&checker.matched)?;
+        Ok(Ok(ValidClassicTx { hash, inner_hash: None, source: source.clone(), fee_source: source, seq_num: tx.seq_num.0, ops, fees, size_bytes, signers: checker.matched, replayable }))
+    }
+
     /// core's `InvokeHostFunctionOpFrame::doCheckValidForSoroban`.
     fn check_host_function(&self, f: &HostFunction) -> Option<String> {
         match f {
@@ -640,7 +1071,7 @@ impl TxValidator<'_> {
 
     /// stellar-core's per-transaction Soroban resource limits.
     fn check_resources(&self, data: &SorobanTransactionData, size_bytes: u32) -> Option<Rejection> {
-        let invalid = |detail: String| Some(Rejection { code: TxCode::SorobanInvalid, detail, fee_bump_inner: false });
+        let invalid = |detail: String| refusal(TxCode::SorobanInvalid, detail);
         let r = &data.resources;
         let l = self.limits;
         let fp = &r.footprint;
@@ -829,11 +1260,20 @@ fn asset_code_valid(code: &[u8]) -> bool {
     len >= min && code[..len].iter().all(u8::is_ascii_alphanumeric) && code[len..].iter().all(|&b| b == 0)
 }
 
-fn asset_valid(asset: &Asset) -> bool {
+pub(super) fn asset_valid(asset: &Asset) -> bool {
     match asset {
         Asset::Native => true,
         Asset::CreditAlphanum4(a) => asset_code_valid(&a.asset_code.0),
         Asset::CreditAlphanum12(a) => asset_code_valid(&a.asset_code.0),
+    }
+}
+
+/// A frozen key, for a rejection's detail.
+fn describe_frozen(k: &LedgerKey) -> String {
+    match k {
+        LedgerKey::Account(a) => a.account_id.to_string(),
+        LedgerKey::Trustline(t) => format!("{} ({:?})", t.account_id, t.asset),
+        other => format!("{other:?}"),
     }
 }
 
@@ -890,6 +1330,19 @@ pub fn available_balance(a: &AccountEntry, base_reserve: u32) -> i64 {
     };
     let entries = 2 + a.num_sub_entries as i64 + sponsoring - sponsored;
     a.balance - entries * base_reserve as i64 - selling
+}
+
+/// core's `getMinBalance`: two base reserves plus one per sub-entry and per
+/// entry the account sponsors, less one per entry sponsored for it.
+pub fn min_balance(a: &AccountEntry, base_reserve: u32) -> i64 {
+    let (sponsoring, sponsored) = match &a.ext {
+        AccountEntryExt::V1(v1) => match &v1.ext {
+            AccountEntryExtensionV1Ext::V2(v2) => (v2.num_sponsoring as i64, v2.num_sponsored as i64),
+            AccountEntryExtensionV1Ext::V0 => (0, 0),
+        },
+        AccountEntryExt::V0 => (0, 0),
+    };
+    (2 + a.num_sub_entries as i64 + sponsoring - sponsored) * base_reserve as i64
 }
 
 /// The ledger and close time of the account's last sequence bump.

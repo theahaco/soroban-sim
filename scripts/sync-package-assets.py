@@ -22,6 +22,8 @@ def assets():
         if name == "cli":
             for source in sorted((ROOT / "fixtures/replay").glob("*.json.gz")):
                 yield source, crate / "fixtures/replay" / source.name
+            for source in sorted((ROOT / "fixtures/replay").glob("*.json")):
+                yield source, crate / "fixtures/replay" / source.name
             for source in sorted((ROOT / "examples/session").glob("*.yaml")):
                 yield source, crate / "examples/session" / source.name
             yield ROOT / "packages/web-demo/tests/fixtures/testnet-fork.json", crate / "fixtures/testnet-fork.json"

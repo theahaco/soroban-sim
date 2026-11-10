@@ -83,7 +83,7 @@ impl Client {
                 Opened::Ready(f) => break *f,
                 Opened::NeedsState(keys) => {
                     rounds += 1;
-                    assert_eq!(keys.len(), 13, "every network setting at once");
+                    assert_eq!(keys.len(), soroban_sim_facade::deferred::OPEN_SETTINGS.len(), "every network setting at once");
                     provide(&base, &network, keys);
                 }
             }
@@ -444,4 +444,109 @@ fn revert_undoes_transactions_and_keeps_them_listed() {
 fn throwaway_addresses_match_the_browser() {
     // packages/soroban-sim/src/session/session.test.ts asserts the same address.
     assert_eq!(g(&Ed25519Key::throwaway("alice")), "GBEFICSBULGI6ZIMM36MCGPLBWQUKAD6JYNR6N3WQD2JOK6BLP4C7F2J");
+}
+
+/// A classic transaction over a deferred base: the facade asks for every key
+/// its operations touch (here the account it creates) in one round, then
+/// applies it in a held ledger.
+#[test]
+fn a_classic_transaction_names_its_keys_in_one_round() {
+    use soroban_env_host::xdr::CreateAccountOp;
+    let mut c = Client::open(PASSPHRASE);
+    let key = rehearse_alice(&mut c);
+    let carol = Ed25519Key::throwaway("carol");
+    let seq = c.sequence(&alice());
+    let PublicKey::PublicKeyTypeEd25519(k) = alice().0;
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(k),
+        fee: 100,
+        seq_num: SequenceNumber(seq + 1),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![Operation { source_account: None, body: OperationBody::CreateAccount(CreateAccountOp { destination: carol.account_id(), starting_balance: 5 * XLM }) }]
+            .try_into()
+            .unwrap(),
+        ext: TransactionExt::V0,
+    };
+    let hash = transaction_hash(&tx, Sha256::digest(PASSPHRASE.as_bytes()).into()).unwrap();
+    let envelope = TransactionEnvelope::Tx(TransactionV1Envelope { tx, signatures: vec![key.sign_decorated(&hash)].try_into().unwrap() });
+
+    c.call("fork_holdLedger", json!({}));
+    c.rounds = 0;
+    let sent = c.call("sendTransaction", json!({ "transaction": envelope.to_xdr_base64(Limits::none()).unwrap() }));
+    assert_eq!(sent["status"], "PENDING");
+    assert_eq!(c.rounds, 1, "carol's account key was asked for with the envelope's own keys");
+    let closed = c.call("fork_closeLedger", json!({}));
+    assert_eq!(closed["transactions"][0]["status"], "SUCCESS", "{closed}");
+    let got = c.call("getTransaction", json!({ "hash": sent["hash"] }));
+    assert_eq!(got["status"], "SUCCESS");
+    assert_eq!(c.sequence(&carol.account_id()), ((FORK_LEDGER + 1) as i64) << 32);
+}
+
+/// A held ledger turns away a fee bump whose fee source cannot pay its bid
+/// on top of the bids it already pays for there, as core's queue does.
+#[test]
+fn a_held_ledger_refuses_bids_a_fee_source_cannot_cover() {
+    use soroban_env_host::xdr::{PaymentOp, TransactionResult, TransactionResultResult};
+    let mut c = Client::open(PASSPHRASE);
+    let frank = Ed25519Key::throwaway("frank");
+    let erin = Ed25519Key::throwaway("erin");
+    let carol = Ed25519Key::throwaway("carol");
+    let dave = Ed25519Key::throwaway("dave");
+    // One XLM is the two base reserves: each has 250 stroops to bid.
+    c.call("fork_setBalance", json!({ "account": g(&frank), "xlm": "1.0000250", "label": "frank" }));
+    c.call("fork_setBalance", json!({ "account": g(&erin), "xlm": "1.0000250", "label": "erin" }));
+    c.call("fork_setBalance", json!({ "account": g(&carol), "xlm": "100", "label": "carol" }));
+    c.call("fork_setBalance", json!({ "account": g(&dave), "xlm": "100", "label": "dave" }));
+    let network_id: [u8; 32] = Sha256::digest(PASSPHRASE.as_bytes()).into();
+    let classic = |c: &mut Client, from: &Ed25519Key, fee: u32| -> TransactionV1Envelope {
+        let seq = c.sequence(&from.account_id());
+        let PublicKey::PublicKeyTypeEd25519(k) = from.account_id().0;
+        let PublicKey::PublicKeyTypeEd25519(to) = alice().0;
+        let tx = Transaction {
+            source_account: MuxedAccount::Ed25519(k),
+            fee,
+            seq_num: SequenceNumber(seq + 1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation { source_account: None, body: OperationBody::Payment(PaymentOp { destination: MuxedAccount::Ed25519(to), asset: soroban_env_host::xdr::Asset::Native, amount: 1 }) }]
+                .try_into()
+                .unwrap(),
+            ext: TransactionExt::V0,
+        };
+        let hash = transaction_hash(&tx, network_id).unwrap();
+        TransactionV1Envelope { tx, signatures: vec![from.sign_decorated(&hash)].try_into().unwrap() }
+    };
+    let bump = |inner: TransactionV1Envelope, payer: &Ed25519Key, fee: i64| -> String {
+        let PublicKey::PublicKeyTypeEd25519(k) = payer.account_id().0;
+        let tx = FeeBumpTransaction { fee_source: MuxedAccount::Ed25519(k), fee, inner_tx: FeeBumpTransactionInnerTx::Tx(inner), ext: FeeBumpTransactionExt::V0 };
+        let hash = fee_bump_hash(&tx, network_id).unwrap();
+        TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope { tx, signatures: vec![payer.sign_decorated(&hash)].try_into().unwrap() }).to_xdr_base64(Limits::none()).unwrap()
+    };
+    let insufficient = |sent: &Value| {
+        assert_eq!(sent["status"], "ERROR", "{sent}");
+        let result = TransactionResult::from_xdr_base64(sent["errorResultXdr"].as_str().unwrap(), Limits::none()).unwrap();
+        assert!(matches!(result.result, TransactionResultResult::TxInsufficientBalance), "{:?}", result.result);
+    };
+
+    c.call("fork_holdLedger", json!({}));
+    // Two fee bumps frank pays 200 for: he can afford one.
+    let a = classic(&mut c, &carol, 100);
+    let a = bump(a, &frank, 200);
+    assert_eq!(c.call("sendTransaction", json!({ "transaction": a }))["status"], "PENDING");
+    let b = classic(&mut c, &dave, 100);
+    let b = bump(b, &frank, 200);
+    insufficient(&c.call("sendTransaction", json!({ "transaction": b })));
+
+    // erin's own transaction (100) and a fee bump she pays (200): 300 > 250.
+    let own = classic(&mut c, &erin, 100);
+    let own = TransactionEnvelope::Tx(own).to_xdr_base64(Limits::none()).unwrap();
+    assert_eq!(c.call("sendTransaction", json!({ "transaction": own }))["status"], "PENDING");
+    let d = classic(&mut c, &dave, 100);
+    let d = bump(d, &erin, 200);
+    insufficient(&c.call("sendTransaction", json!({ "transaction": d })));
+
+    let closed = c.call("fork_closeLedger", json!({}));
+    let statuses: Vec<&str> = closed["transactions"].as_array().unwrap().iter().map(|t| t["status"].as_str().unwrap()).collect();
+    assert_eq!(statuses, ["SUCCESS", "SUCCESS"], "{closed}");
 }

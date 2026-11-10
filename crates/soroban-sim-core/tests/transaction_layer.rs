@@ -149,7 +149,7 @@ fn classic_entries_in_the_footprint_are_metered_as_disk_reads() {
         d.resources.disk_read_bytes = 10;
     });
     let r = s.submit("two accounts in 10 disk-read bytes", &starved).unwrap();
-    let TxStatus::Failed { code: OpFailure::ResourceLimitExceeded, .. } = &r.status else { panic!("{}", r.status.summary()) };
+    let TxStatus::Failed { code: Some(OpFailure::ResourceLimitExceeded), .. } = &r.status else { panic!("{}", r.status.summary()) };
     assert!(r.fee_charged > 0, "an included failure still pays");
     let TransactionResultResult::TxFailed(ops) = r.transaction_result().result else { panic!() };
     assert_eq!(ops.as_slice(), [OperationResult::OpInner(OperationResultTr::InvokeHostFunction(InvokeHostFunctionResult::ResourceLimitExceeded))]);

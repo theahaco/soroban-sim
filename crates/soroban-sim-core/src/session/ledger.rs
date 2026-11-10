@@ -3,10 +3,12 @@
 //!
 //! A key resolves in this order:
 //!
-//! 1. the overlay (every write a transaction applied, and every override);
-//! 2. storage of a contract the session itself created, answered absent
+//! 1. open nested layers, newest first ([`ForkedLedger::begin`]): writes a
+//!    transaction or operation has not committed yet, like core's `LedgerTxn`;
+//! 2. the overlay (every write a transaction applied, and every override);
+//! 3. storage of a contract the session itself created, answered absent
 //!    locally because the base network cannot hold it;
-//! 3. the base cache, filled lazily from the [`LedgerSource`] in batches.
+//! 4. the base cache, filled lazily from the [`LedgerSource`] in batches.
 //!
 //! The cache keeps the base's answer verbatim, so an archived entry (a
 //! persistent entry or code whose live-until ledger has passed, which RPC
@@ -224,6 +226,14 @@ impl DiffEntry {
     }
 }
 
+/// One key an operation changed, before and after it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntryChange {
+    pub key: LedgerKey,
+    pub before: Option<StoredEntry>,
+    pub after: Option<StoredEntry>,
+}
+
 /// Counters for the report.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LedgerStats {
@@ -247,6 +257,8 @@ pub struct ForkedLedger {
     fork_ledger: u32,
     base_cache: RefCell<BTreeMap<LedgerKey, Option<StoredEntry>>>,
     overlay: RefCell<BTreeMap<LedgerKey, Option<StoredEntry>>>,
+    /// Nested uncommitted writes, innermost last.
+    layers: RefCell<Vec<BTreeMap<LedgerKey, Option<StoredEntry>>>>,
     overrides: RefCell<Vec<Override>>,
     fetches: RefCell<Vec<FetchRecord>>,
     fetch_calls: Cell<u32>,
@@ -263,6 +275,7 @@ impl ForkedLedger {
             fork_ledger,
             base_cache: Default::default(),
             overlay: Default::default(),
+            layers: Default::default(),
             overrides: Default::default(),
             fetches: Default::default(),
             fetch_calls: Default::default(),
@@ -283,11 +296,10 @@ impl ForkedLedger {
     /// Fetch every key the session knows nothing about, in batches.
     pub fn prefetch(&self, keys: &[LedgerKey]) -> Result<()> {
         let missing: Vec<LedgerKey> = {
-            let overlay = self.overlay.borrow();
             let cache = self.base_cache.borrow();
             let mut seen = BTreeSet::new();
             keys.iter()
-                .filter(|k| !overlay.contains_key(*k) && !cache.contains_key(*k))
+                .filter(|k| self.local(k).is_none() && !cache.contains_key(*k))
                 .filter(|k| seen.insert((*k).clone()))
                 .cloned()
                 .collect()
@@ -318,8 +330,8 @@ impl ForkedLedger {
 
     /// The session's current value of `key`.
     pub fn get(&self, key: &LedgerKey) -> Result<Option<StoredEntry>> {
-        if let Some(slot) = self.overlay.borrow().get(key) {
-            return Ok(slot.clone());
+        if let Some(slot) = self.local(key) {
+            return Ok(slot);
         }
         if self.created_in_session(key) {
             self.local_answers.set(self.local_answers.get() + 1);
@@ -337,9 +349,89 @@ impl ForkedLedger {
         Ok(self.base_cache.borrow().get(key).cloned().flatten())
     }
 
-    /// Record a session write (`None` deletes).
+    /// Record a session write (`None` deletes), into the innermost open
+    /// layer if there is one.
     pub fn put(&self, key: LedgerKey, value: Option<StoredEntry>) {
-        self.overlay.borrow_mut().insert(key, value);
+        match self.layers.borrow_mut().last_mut() {
+            Some(layer) => layer.insert(key, value),
+            None => self.overlay.borrow_mut().insert(key, value),
+        };
+    }
+
+    /// What the session itself holds for `key` (open layers, then the
+    /// overlay), without asking the base.
+    fn local(&self, key: &LedgerKey) -> Option<Option<StoredEntry>> {
+        for layer in self.layers.borrow().iter().rev() {
+            if let Some(slot) = layer.get(key) {
+                return Some(slot.clone());
+            }
+        }
+        self.overlay.borrow().get(key).cloned()
+    }
+
+    /// Open a nested layer: writes from here on stay in it until
+    /// [`ForkedLedger::commit`] folds them into the layer below (or the
+    /// overlay) or [`ForkedLedger::rollback`] drops them.
+    pub fn begin(&self) {
+        self.layers.borrow_mut().push(BTreeMap::new());
+    }
+
+    /// Keep the innermost layer's writes.
+    pub fn commit(&self) {
+        let Some(top) = self.layers.borrow_mut().pop() else { return };
+        for (key, value) in top {
+            self.put(key, value);
+        }
+    }
+
+    /// Drop the innermost layer's writes.
+    pub fn rollback(&self) {
+        self.layers.borrow_mut().pop();
+    }
+
+    /// How many layers are open.
+    pub fn depth(&self) -> usize {
+        self.layers.borrow().len()
+    }
+
+    /// Drop every layer opened since there were `depth`.
+    pub fn rollback_to(&self, depth: usize) {
+        self.layers.borrow_mut().truncate(depth);
+    }
+
+    /// How many keys the innermost open layer wrote.
+    pub fn open_writes(&self) -> usize {
+        self.layers.borrow().last().map_or(0, BTreeMap::len)
+    }
+
+    /// What the innermost open layer changed: each key it wrote, with its
+    /// value beneath the layer and its value in it.
+    pub fn open_changes(&self) -> Result<Vec<EntryChange>> {
+        let top = self.layers.borrow().last().cloned().unwrap_or_default();
+        let mut out = vec![];
+        for (key, after) in top {
+            let before = self.beneath_top(&key)?;
+            if before != after {
+                out.push(EntryChange { key, before, after });
+            }
+        }
+        Ok(out)
+    }
+
+    /// `key` as it reads without the innermost layer.
+    fn beneath_top(&self, key: &LedgerKey) -> Result<Option<StoredEntry>> {
+        {
+            let layers = self.layers.borrow();
+            for layer in layers[..layers.len().saturating_sub(1)].iter().rev() {
+                if let Some(slot) = layer.get(key) {
+                    return Ok(slot.clone());
+                }
+            }
+        }
+        if let Some(slot) = self.overlay.borrow().get(key) {
+            return Ok(slot.clone());
+        }
+        self.base(key)
     }
 
     /// Storage of a contract whose instance the session created: the base
@@ -354,8 +446,7 @@ impl ForkedLedger {
             key: ScVal::LedgerKeyContractInstance,
             durability: ContractDataDurability::Persistent,
         });
-        matches!(self.base_cache.borrow().get(&instance), Some(None))
-            && matches!(self.overlay.borrow().get(&instance), Some(Some(_)))
+        matches!(self.base_cache.borrow().get(&instance), Some(None)) && matches!(self.local(&instance), Some(Some(_)))
     }
 
     pub fn account(&self, id: &AccountId) -> Result<Option<AccountEntry>> {
@@ -497,11 +588,13 @@ impl ForkedLedger {
     /// The session's writes and overrides now. What the base said stays
     /// cached across a restore: it describes the base, not the session.
     pub fn checkpoint(&self) -> LedgerCheckpoint {
+        debug_assert!(self.layers.borrow().is_empty(), "checkpoint inside an open layer");
         LedgerCheckpoint { overlay: self.overlay.borrow().clone(), overrides: self.overrides.borrow().clone() }
     }
 
     /// Return to `checkpoint`: every write and override since is undone.
     pub fn restore(&self, checkpoint: &LedgerCheckpoint) {
+        self.layers.borrow_mut().clear();
         *self.overlay.borrow_mut() = checkpoint.overlay.clone();
         *self.overrides.borrow_mut() = checkpoint.overrides.clone();
     }

@@ -20,8 +20,11 @@ cargo run -p soroban-sim-cli -- session run examples/session/perch-nido-bootstra
 ```
 
 `examples/session/perch-nido-bootstrap.yaml` is the Perch/Nido registry
-bootstrap on mainnet: 34 envelopes, 31 of them applied, plus the negative
-controls. `crates/soroban-sim-cli/tests/rehearsal.yaml` is a smaller plan that
+bootstrap on mainnet: 37 envelopes, 33 of them applied, plus the negative
+controls. The accounts it needs besides the root manager's are created and
+funded by real `CreateAccount` operations, and the admin account takes a
+co-signer through `SetOptions`, so the only overrides are the root manager's
+key substitution and top-up. `crates/soroban-sim-cli/tests/rehearsal.yaml` is a smaller plan that
 runs offline over the repository's fixture contracts and uses every step kind
 and signer adapter.
 
@@ -48,10 +51,15 @@ did not, and 2 on an error before or outside the steps.
 
 ```text
 Session (soroban-sim-core::session)
-  prepare(): simulate (recording) -> sign auth entries -> re-simulate
-             (enforcing, so signature checks are metered) -> signed envelope
-  submit():  TxValidator -> Applier -> close the ledger
-  ForkedLedger: overlay + logged overrides over a lazily fetched base
+  prepare():         simulate (recording) -> sign auth entries -> re-simulate
+                     (enforcing, so signature checks are metered) -> signed envelope
+  prepare_classic(): classic operations -> signed envelope
+  submit_ledger():   the transaction set (TxValidator; one per source account,
+                     each fee source's bids within its balance, per-ledger
+                     limits) -> every fee -> each transaction validated
+                     again and applied in core's order -> refunds -> close
+  submit():          submit_ledger() with one envelope
+  ForkedLedger:      overlay + logged overrides over a lazily fetched base
 ```
 
 - **ForkedLedger.** Session writes and overrides live in an overlay over a
@@ -61,27 +69,93 @@ Session (soroban-sim-core::session)
   absent one. Storage of a contract the session created is answered absent
   locally. Every fetch is logged with the ledger it was served at and the
   entry's last-modified ledger, which is the drift report.
-- **TxValidator.** The subset of stellar-core's `TransactionFrame` a Soroban
+- **TxValidator.** The subset of stellar-core's `TransactionFrame` a
   transaction meets before it applies: time and ledger bounds, minimum
   sequence number, sequence age and gap, extra signers, the sequence number,
-  envelope signatures ported from core's `SignatureChecker` (the source's low
-  threshold, then the operation's medium threshold, then `txBAD_AUTH_EXTRA`
-  for an unused signature), the fee bid, the resource fee against the
-  non-refundable fee of the declared resources, the network's per-transaction
-  limits, and the source's balance above its reserve and liabilities. A
-  rejected envelope pays nothing and reaches no ledger.
-- **Applier.** The fee is charged and the sequence number consumed first, so a
-  failed operation still pays. The host runs in enforcing mode over the
+  frozen ledger keys (CAP-77), envelope signatures ported from core's
+  `SignatureChecker` (the source's low threshold, then each operation's
+  threshold, then `txBAD_AUTH_EXTRA` for an unused signature), the fee bid,
+  for Soroban the resource fee against the non-refundable fee of the declared
+  resources and the network's per-transaction limits, for classic each
+  operation's well-formedness (`doCheckValid`), and the source's balance above
+  its reserve and liabilities. A rejected envelope pays nothing and reaches no
+  ledger.
+- **Applier.** The ledger close charges the fee and consumes the sequence
+  number first, so a failed operation still pays. The host runs in enforcing
+  mode over the
   declared footprint and instruction budget with a session module cache (as
   core keeps every live contract pre-parsed; without it the host charges full
   Wasm parsing and real budgets fail). Archived entries marked for restore get
   core's restored TTL, unmarked ones fail the operation, expired temporary
   entries are absent. Written bytes and events are checked against the
   declared and network limits, rent and events are charged against the
-  refundable fee, and the rest is refunded.
-- **Clock.** One ledger closes per applied transaction, 5 s apart by default.
-  `advance` closes many at once in O(1); TTLs follow the sequence number, so
-  expiry and archival follow from it.
+  refundable fee, and the rest is refunded once the ledger's transactions have
+  all applied.
+- **Clock.** Each submission closes a ledger (a `ledger` block closes one for
+  several transactions), 5 s apart by default. `advance` closes many at once
+  in O(1); TTLs follow the sequence number, so expiry and archival follow from
+  it.
+
+## Classic operations
+
+`CreateAccount`, `Payment` (XLM and issued assets), `SetOptions` (signers,
+thresholds, master weight, home domain, flags, inflation destination) and
+`ChangeTrust` (open, change, close a trustline) are ports of stellar-core
+v29's operation frames: `doCheckValid` before inclusion (a malformed
+operation is `txFAILED` with its `…_MALFORMED` code and pays nothing), then
+`doApply` against the ledger in core's check order, so the first failing check
+decides the result code (`CREATE_ACCOUNT_LOW_RESERVE`, `PAYMENT_UNDERFUNDED`,
+`PAYMENT_NO_TRUST`, `SET_OPTIONS_TOO_MANY_SIGNERS`, `CHANGE_TRUST_INVALID_LIMIT`,
+`opTOO_MANY_SUBENTRIES`, …). Reserves count sub-entries (signers and
+trustlines), sponsorships the fork already holds are released the way core
+releases them, and an issuer pays and is paid from its own unlimited line.
+Each operation's source must sign at its threshold: high for signer, weight
+and threshold changes, medium otherwise. An operation may name an account
+created earlier in the same transaction as its source, signed by that key.
+Every operation of a transaction runs and reports its result, but a failed
+transaction keeps none of their writes, only its fee and sequence number.
+
+Not modelled (the validator refuses them with `txNOT_SUPPORTED`): path
+payments, offers and the DEX, liquidity pools, claimable balances, clawback,
+creating sponsorships, account merges, manage data and bump sequence.
+
+`crates/soroban-sim-cli/tests/classic_replay.rs` checks the port against the
+network: it replays a recorded sample of real mainnet classic transactions
+(`fixtures/replay/classic-mainnet.json`), each on a fork of exactly the state
+it applied against, and requires the network's result code, every
+operation's result, the fee charged and every entry's after-image.
+
+## Several transactions per ledger
+
+`Session::submit_ledger` (a plan's `ledger` block, the facade's
+`fork_holdLedger`) closes one ledger the way core closes one:
+
+1. **The set.** Each envelope is validated against the ledger as it was
+   before; a refused one gets its result code. Core's queue holds one
+   transaction per source account, so a second one waits for the next ledger.
+   As core's queue does, the fee bids are totalled per fee source in submission
+   order, and the transaction that takes its fee source past its balance above
+   the reserve is refused with `txINSUFFICIENT_BALANCE`. The per-ledger limits come from the ledger: the header's `maxTxSetSize`
+   (classic operations; a snapshot saved from an RPC fork keeps it, and one
+   without it has no classic limit) and the `ConfigSetting` entries for the Soroban phase
+   (transactions, instructions, transaction bytes, disk reads and writes). The
+   highest inclusion fee rate goes first; what does not fit waits for the next
+   ledger, and what no ledger can hold is refused.
+2. **Apply order.** The classic phase, then the Soroban phase, each shuffled by
+   the transaction's full hash XOR the transaction-set hash, as core orders
+   them.
+3. **Fees first.** Every fee is charged before any transaction applies, so an
+   earlier transaction cannot spend a later one's fee.
+4. **Apply.** Each transaction is validated again against the ledger as the
+   ones before it left it (core's apply-time checks: a source whose threshold
+   changed meanwhile fails with `txFAILED`/`opBAD_AUTH` and still pays), its
+   sequence number consumed and a pre-auth signer for it removed, then its
+   operations applied. Soroban transactions get core's PRNG seed,
+   `sha256(txSetHash ‖ applyIndex)`, over the session's own transaction set.
+5. **Refunds** once every transaction has applied, then the ledger closes.
+
+An error (an RPC fetch failing, say) leaves the session as it was before the
+call, even when an earlier ledger of the batch had already closed.
 
 ## Signers
 
@@ -169,6 +243,12 @@ Steps have a `name` and exactly one action:
 | `deploy: { deployer, salt, wasm_hash, args }` | `CreateContractV2` with constructor arguments. |
 | `deploy_sac: native` | The native asset's Stellar Asset Contract. |
 | `envelope: base64` | Submit a signed envelope as is. |
+| `create_account: { destination, starting_balance }` | A classic transaction with one `CreateAccount` (XLM, up to 7 decimals). |
+| `payment: { destination, asset, amount }` | `Payment`; `asset` is `native` (the default) or `CODE:ISSUER`. |
+| `set_options: { signer: { key, weight }, master_weight, low_threshold, med_threshold, high_threshold, home_domain, set_flags, clear_flags, inflation_dest }` | `SetOptions`; `key` is a plan key or a G address, weight 0 removes the signer; flags by name (`auth_required`, `auth_revocable`, `auth_immutable`, `auth_clawback_enabled`) or bits. |
+| `change_trust: { asset: CODE:ISSUER, limit }` | `ChangeTrust`; no `limit` is the maximum, 0 closes the line. |
+| `operations: [ … ]` | One classic transaction of several operations, each one of the four above with an optional `source`. |
+| `ledger: [ steps ]` | Transaction steps submitted for the same ledger (see above). Each is prepared against the state before the ledger, sequence numbers chained per source, and reported on its own row. |
 | `view: { contract, fn, args }` | A read-only call; `fresh_fork: true` runs it on a fork without the session's writes and overrides. |
 | `advance: { ledgers, seconds } \| { to_ledger } \| { to_time } \| { seconds }` | Close ledgers. |
 | `set: { name: value }` | Set variables now (for example `{ ledger_plus: 40 }`). |
@@ -177,24 +257,53 @@ Steps have a `name` and exactly one action:
 
 Transaction steps also take `source`, `sign_with: [keys]` (default: the
 classic signers registered for the source, else the key whose account is the
-source), `auth: { address: signer }` (over the plan's `signers`),
+source; a classic step adds the keys of its operations' sources),
+`fee_bump: { source, fee, sign_with }` (another account pays the fee in a fee
+bump; `fee` defaults to the inner transaction's inclusion rate over one more
+operation, and the fee source's signers resolve like a source's), `auth: { address: signer }` (over the plan's `signers`),
 `auth_expiration_ledgers`, `save_envelope: name`, and `hold: true` (prepare and
 sign but do not submit; submit it later with `envelope: "${name}"`).
 
 Every step may `save: name` its rendered result and set `expect`:
 `{ equals: text }`, `{ value: ScVal JSON }`, or `{ fails: true | "text" }` (the
 step must not apply, and the outcome must mention the text: `txBAD_AUTH`,
-`txBAD_SEQ`, `3002`, …). A step without `expect` must succeed, and the run
-stops at the first one that does not.
+`txBAD_SEQ`, `3002`, `opBAD_AUTH`, `PAYMENT_UNDERFUNDED`, …). A classic
+step's outcome names every operation's result code. A step without `expect`
+must succeed, and the run stops at the first one that does not.
+
+```yaml
+steps:
+  - name: theahaco creates the admin's and the CI delegate's accounts
+    operations:
+      - create_account: { destination: "${key.admin}", starting_balance: 10 }
+      - create_account: { destination: "${key.ci}", starting_balance: 5 }
+  - name: one ledger, two sources
+    ledger:
+      - name: the admin account adds a co-signer
+        source: "${key.admin}"
+        set_options: { signer: { key: admin_backup, weight: 1 }, low_threshold: 1, med_threshold: 2, high_threshold: 2 }
+      - name: create-registry perch
+        invoke: { contract: "${root}", fn: deploy, args: [ … ] }
+  - name: "negative: the admin's key alone"
+    payment: { destination: "${theahaco}", amount: "0.0000001" }
+    source: "${key.admin}"
+    sign_with: [admin]
+    expect: { fails: opBAD_AUTH }
+```
 
 ## The report
 
 `PREFIX.json` (format `soroban-sim-session-report/1`) and `PREFIX.md` hold:
 the fork point and host version; per-step outcome, fees (bid, resource,
 non-refundable, refundable, charged, refunded, rent, events), CPU used against
-declared, writes, restores, contract errors, and the matched signers; every
-override; fees by payer with the largest fee bid each must cover; account
-balances before and after; the final diff against the fork point; drift (the
+declared, writes, restores, contract errors, the matched signers, and for
+classic transactions every operation's result code, the position in the
+ledger's apply order, why it waited for a later ledger, and the code of a
+transaction refused by the checks core repeats at apply; every override; fees
+by payer with the largest fee bid each must cover; account balances and
+sequence numbers before and after, with every other change (signers added,
+reweighed or removed, thresholds, home domain, flags, sub-entries); trustline
+balances and limits; the final diff against the fork point; drift (the
 ledgers fetches were served at and any entry modified after the fork ledger);
 fetch counts; the differential results; and the safety section.
 
@@ -252,30 +361,34 @@ order, and is checked against real network transactions: `soroban-sim replay`
 replays samples of recent mainnet and testnet Soroban transactions, fee bumps
 and smart-account `__check_auth` included, and compares every result, return
 value, event, after-image, fee and core resource metric
-([`docs/replay.md`](replay.md)). The committed sample matches exactly.
+([`docs/replay.md`](replay.md)); `tests/classic_replay.rs` does the same for
+classic transactions. The committed samples match exactly.
 
 Modelled: v1 and fee-bump envelopes (`txFEE_BUMP_INNER_FAILED` for an inner
-rejection), muxed sources, preconditions, sequence numbers, signatures and
-thresholds, pre-authorized-transaction signers removed after use, the inclusion
-fee capped at the lane base fee (`SubmitOptions::lane_base_fee`, for a
-surge-priced ledger), the resource fee and per-transaction limits, footprint key
-and entry size limits, disk-read metering of classic and restored entries,
-restores of marked archived entries only, rent and events against the
-refundable fee, and refunds to the fee source.
+rejection), Soroban or classic inside, muxed sources, preconditions, sequence
+numbers, frozen ledger keys (CAP-77), signatures and thresholds,
+pre-authorized-transaction signers removed after use, the inclusion fee capped
+at the lane base fee (`SubmitOptions::lane_base_fee`, for a surge-priced
+ledger), the resource fee and per-transaction limits, footprint key and entry
+size limits, disk-read metering of classic and restored entries, restores of
+marked archived entries only, rent and events against the refundable fee,
+refunds to the fee source, the classic operations above, and ledgers of
+several transactions with core's per-ledger limits and apply order. Each
+transaction gets core's PRNG seed, `sha256(txSetContentsHash || applyIndex)`,
+over the session's own transaction set (`SubmitOptions::prng_seed` sets the
+real one, for a replay).
 
-Not modelled yet: classic operations (funding is an override), `ExtendFootprintTtl`
-and `RestoreFootprint` operations (an `InvokeHostFunction` restores marked
-entries itself), several transactions per ledger and per-ledger limits, and
-core's PRNG seed by default (`SubmitOptions::prng_seed` sets it; core seeds each
-transaction with `sha256(txSetContentsHash || applyIndex)`). One consequence of
-one transaction per ledger: in a parallel Soroban phase core bumps every
-transaction's sequence number before any executes, so a transaction whose
-footprint holds its own source account sees later same-source transactions'
-bumps; a session cannot.
+Not modelled yet: `ExtendFootprintTtl` and `RestoreFootprint` operations (an
+`InvokeHostFunction` restores marked entries itself), the other classic
+operations, surge pricing beyond a given lane base fee, and core's parallel
+Soroban clusters (a ledger's Soroban phase is one cluster). In a parallel
+Soroban phase core bumps every transaction's sequence number before any
+executes; the session bumps each as it applies, so a Soroban transaction whose
+footprint holds another transaction's source account sees that bump only if
+the other applied first.
 
 The same session also runs behind an RPC facade, `soroban-sim serve --fork …`,
 so existing scripts and stock tools rehearse themselves unchanged
 ([`docs/rpc-facade.md`](rpc-facade.md)), and in the browser, where the web
 demo serves it to stellar-sdk at a virtual RPC URL
-([`docs/browser-session.md`](browser-session.md)). Later phases (see #23):
-classic operations.
+([`docs/browser-session.md`](browser-session.md)).

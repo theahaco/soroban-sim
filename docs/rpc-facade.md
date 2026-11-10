@@ -84,8 +84,8 @@ The stellar-rpc methods:
 | `getLatestLedger` | The last closed session ledger, with a `headerXdr` copied from the fork's header and a header-only `metadataXdr`. |
 | `getLedgerEntries` | The session's view of each key: the overlay first (session writes, overrides), then the base, read lazily. Archived entries come back as RPC returns them; expired temporary entries are absent. TTL keys are refused, as RPC refuses them. |
 | `simulateTransaction` | soroban-simulation against the session's state, in the ledger the next transaction would apply in. It uses stellar-rpc's resource padding, `resourceConfig.instructionLeeway`, the `enforce`/`record`/`record_allow_nonroot` auth modes (default: enforce when the operation carries auth entries), and `useUpgradedAuth`. A failed call is the result's `error`: the host error plus its event log, newest first. |
-| `sendTransaction` | Validates and applies through the same session (signatures, thresholds, sequence numbers, fees, balance, limits). `PENDING` once applied (one ledger per transaction), `ERROR` with `errorResultXdr` when rejected, `DUPLICATE` for a hash already applied. |
-| `getTransaction` | `SUCCESS` or `FAILED` with `envelopeXdr`, `resultXdr`, a V4 `resultMetaXdr` (return value, events, fees, entry changes) and `events`; `NOT_FOUND` otherwise. |
+| `sendTransaction` | Validates and applies through the same session (signatures, thresholds, sequence numbers, fees, balance, limits), Soroban and classic (`CreateAccount`, `Payment`, `SetOptions`, `ChangeTrust`) alike, in v1 or fee-bump envelopes. `PENDING` once applied (one ledger per transaction) or queued in a held ledger, `ERROR` with `errorResultXdr` when rejected (in a held ledger, also `txSOROBAN_INVALID` when no ledger can hold it, or `txINSUFFICIENT_BALANCE` when the fee source cannot pay this bid on top of the ones it already pays for there), `DUPLICATE` for a hash already applied or queued, `TRY_AGAIN_LATER` when a held ledger already has a transaction from the same source (core's queue holds one per account). |
+| `getTransaction` | `SUCCESS` or `FAILED` with `envelopeXdr`, `resultXdr` (a classic transaction's carries every operation's result), a V4 `resultMetaXdr` (return value, events, fees, entry changes; for a classic transaction each operation's changes and no Soroban meta), `applicationOrder` and `events`; `NOT_FOUND` otherwise, and while it waits in a held ledger. |
 | `getEvents` | Contract and system events of the session's transactions, with `type`, `contractIds` and topic filters (`*`, trailing `**`), `startLedger`/`endLedger` and cursor pagination. |
 
 The admin methods take named params. Every override is logged in the report,
@@ -99,15 +99,19 @@ and each call that changes state is a step:
 | `fork_removeLedgerEntry` | `key` (LedgerKey XDR), `label` | Removes any entry. |
 | `fork_advanceLedgers` | `ledgers` or `toLedger`, `seconds` | Closes ledgers; TTLs follow the sequence number. |
 | `fork_setTime` | `time`, `ledgers` | Moves the clock so the next ledger closes at exactly `time` (Tansu windows, `not-after` rules), closing one ledger per clock step unless `ledgers` says otherwise. |
+| `fork_holdLedger` | | Keeps the next ledger open: transactions sent from now on wait in it until `fork_closeLedger`. |
+| `fork_closeLedger` | | Closes the held ledger with every transaction sent since, the way core builds and applies one transaction set (per-ledger limits, classic phase first, every fee before any applies, the checks core repeats at apply), then goes back to one ledger per transaction. Returns each transaction's `hash`, `status` (`SUCCESS`, `FAILED`, or `DROPPED` when the ledger refused it), `ledger`, `applicationOrder`, `resultXdr`, and `deferred` when it had to wait for a later ledger. If the close fails, nothing applies and the ledger stays held, to close again. |
 | `fork_snapshot` | `label` | Returns an `id`. |
 | `fork_revert` | `id` | Undoes every transaction, override and clock move since. Later snapshots are dropped; this one stays, to revert to again. |
 | `fork_report` | | `passed`, `failures`, the JSON report and the Markdown, and the files written. |
-| `fork_info` | | Fork point, clock, counts, snapshots, the safety setting, and `replayable`: how many signatures valid on the real network the session has seen (refused, rejected or applied). A Mainnet session refuses such an envelope even when it would be rejected anyway. |
+| `fork_info` | | Fork point, clock, counts, snapshots, the held ledger's transactions, the safety setting, and `replayable`: how many signatures valid on the real network the session has seen (refused, rejected or applied). A Mainnet session refuses such an envelope even when it would be rejected anyway. |
 | `fork_allowRealSigners` | `allow` | Apply (or again refuse) envelopes a signer of the real network signed, from now on. A step records the change; the report still fails on any such signature on mainnet. |
 | `fork_steps` | | Every step in order: its report row, what it changed (each entry before and after), its envelope's authorization entries, and whether the debugger can trace it. |
-| `fork_debugContext` | `step` | What a debugger needs to trace a transaction step again: its host function and source, the ledger it applied in, and its footprint's entries just before it. |
+| `fork_debugContext` | `step` | What a debugger needs to trace a transaction step again: its host function and source, the ledger it applied in, and its footprint's entries just before it (for a transaction of a held ledger, as the ledger started). |
 
-The clock cannot move back. To go back, revert to a snapshot. In the report,
+The clock cannot move back, and it does not move while a held ledger has
+transactions waiting (`fork_advanceLedgers`, `fork_setTime` and `fork_snapshot`
+ask for `fork_closeLedger` first; `fork_revert` drops the held ledger). To go back, revert to a snapshot. In the report,
 reverted steps stay listed and are marked as reverted. The fees, accounts and
 diff describe the session as it ended.
 
@@ -136,11 +140,18 @@ and [`replay.md`](replay.md)). On top of it:
   in. stellar-rpc simulates in its latest closed ledger.
 - `resultMetaXdr` is rebuilt from each touched entry's value before and after
   the transaction, data and TTL entries alike. It is not core's exact change
-  list. Fee events are not emitted.
+  list, and in a held ledger "before" is the ledger's start. Fee events are not
+  emitted.
+- A transaction a held ledger refuses when it closes (an earlier one of the
+  ledger spent what it needed) never gets a result, as on the network:
+  `getTransaction` keeps answering `NOT_FOUND`, and `fork_closeLedger` and the
+  report say why.
 - Not served: `getLedgers`, `getTransactions`, `xdrFormat: json`,
   `ExtendFootprintTtl` and `RestoreFootprint` (archived entries in an
-  `InvokeHostFunction` footprint restore automatically), v0 envelopes,
-  classic operations, and friendbot (use `fork_setBalance`).
+  `InvokeHostFunction` footprint restore automatically), v0 envelopes, the
+  classic operations the session does not model
+  ([`docs/session.md`](session.md#classic-operations)), and friendbot (use
+  `fork_setBalance`, or a `CreateAccount` from a funded account).
 - History before the fork is not there. `getTransaction` knows only session
   transactions, and `getEvents` starts at the fork.
 - The facade answers one request at a time. A session is one ordered history.

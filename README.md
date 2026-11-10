@@ -213,7 +213,10 @@ transaction-envelope decoding, and cancellation / budget limits.
 `soroban-sim-core::session` rehearses many signed transactions in order over a
 fork of a real network, and the `soroban-sim` CLI (`crates/soroban-sim-cli`)
 runs a plan file through it and writes a JSON and a Markdown report. Nothing is
-ever submitted; throwaway keys stand in for every real signer.
+ever submitted; throwaway keys stand in for every real signer. Besides contract
+calls, a session applies the classic operations a setup runs around them
+(`CreateAccount`, `Payment`, `SetOptions`, `ChangeTrust`) and can close a
+ledger with several transactions, as stellar-core does.
 
 ```sh
 cargo run -p soroban-sim-cli -- session run examples/session/perch-nido-bootstrap.yaml \
