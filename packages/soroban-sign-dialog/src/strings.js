@@ -5,6 +5,8 @@
 // and amounts as small pieces of markup), so an override only has to escape
 // text of its own.
 
+const and = (xs) => (xs.length < 2 ? xs.join('') : `${xs.slice(0, -1).join(', ')} and ${xs.at(-1)}`);
+
 export const STRINGS = {
   // Header and footer.
   networks: { testnet: 'Testnet', mainnet: 'Mainnet', futurenet: 'Futurenet', local: 'Local network' },
@@ -21,9 +23,13 @@ export const STRINGS = {
   approveAnyway: 'Approve anyway',
   confirmApproveAnyway: 'Confirm: approve anyway',
 
-  // The summary at the top: one plain line per authorized call, and the
+  // The summary at the top: one plain line per authorized call, naming the
+  // payments you make in its sub-calls and counting the rest, and the
   // spending cap when the preview found one.
   summarySend: (p) => `Send ${p.amount} to ${p.to}`,
+  summaryLine: (p) => `${p.lead}${p.payments.length ? `, paying ${and(p.payments)}` : ''}${p.more ? `${p.payments.length ? ',' : ''} ${p.more}` : ''}`,
+  summaryPayment: (p) => `${p.amount} to ${p.to}`,
+  summaryMore: (p) => (p.count === 1 ? 'and 1 more call' : `and ${p.count} more calls`),
   summaryUnusedTag: 'not used',
   summaryBudget: (p) => (p.over
     ? `Over the cap: ${p.left} of ${p.limit} ${p.code} left this window`

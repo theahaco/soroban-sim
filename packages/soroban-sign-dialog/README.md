@@ -176,6 +176,10 @@ Top to bottom, by default:
 1. **A summary** of what is being approved, one plain line per authorized
    call ("Send 2 XLM to Corner Café"), and, when the preview finds a spending
    cap, how much of it is left ("5 of 10 XLM left this window after this").
+   A line also names the payments of known tokens that the signer makes in
+   the call's sub-calls ("Call swap on Router, paying 2 XLM to Pool"), up to
+   three, and counts the other sub-calls ("and 2 more calls"); the count
+   opens Details, which lists them all.
 2. **One status** for the simulated outcome: *Will succeed*, *Will be
    refused* or *Outcome unknown*, with a one-line reason. It runs as the dialog
    opens when an engine or provider is set. On a protocol the engine has no
@@ -221,7 +225,7 @@ Light and dark follow `prefers-color-scheme`; `theme="light"` or
 inside your own dark-mode rule.
 
 Parts: `dialog`, `header`, `network`, `dapp`, `title`, `fee`, `body`, `what`,
-`budget-line`, `status`, `status-reason`, `warning`, `details`, `details-summary`,
+`summary-more`, `budget-line`, `status`, `status-reason`, `warning`, `details`, `details-summary`,
 `tree`, `entry`, `unused-entry`, `node`, `node-details`, `doc`, `preview`,
 `preview-button`, `auth-check`, `verdict`, `budget`, `balances`, `events`,
 `notice`, `footer`, `approve`, `reject`.

@@ -16,7 +16,7 @@
 
 import {
   XdrError, decodeEnvelope, decodeAuthEntry, decodeEvent, compareAuth, transactionHash, nativeAssetContract,
-  formatAmount, NETWORKS, TOKEN_FNS, PERCH_FNS, toB64, hex, sha256, short, tryJson,
+  formatAmount, NETWORKS, TOKEN_FNS, PERCH_FNS, toB64, hex, sha256, short, tryJson, paymentOf, subCallSummary,
 } from './xdr.js';
 import { mergeStrings } from './strings.js';
 import { STYLE } from './style.js';
@@ -560,21 +560,31 @@ export class SorobanSignDialog extends Base {
       <div><b>${title}</b>${o.reason ? `<div class="small" part="status-reason">${o.reason}</div>` : ''}${button}</div></section>`;
   }
 
+  #payment(p) {
+    return { amount: this.#amount(p.amount, p.token), to: this.#addr(p.to) };
+  }
+
   /** A one-line, plain account of one authorized call. */
   #summaryLine(fn) {
-    if (fn.kind === 'call' && fn.fn === 'transfer' && fn.args.length === 3) {
-      const token = this.#token(fn.contract.str);
-      const [from, to, amount] = fn.args;
-      if (token && from?.str === this.signer && /128|64/.test(amount?.t ?? '')) return this.#t('summarySend', { amount: this.#amount(amount.v, token), to: this.#addr(to) });
-    }
-    return this.#sentence(fn);
+    const p = paymentOf(fn, this.signer, (c) => this.#token(c));
+    return p ? this.#t('summarySend', this.#payment(p)) : this.#sentence(fn);
+  }
+
+  /** The call, the signer's payments in its sub-calls, and a count of the rest, which Details lists. */
+  #summaryEntry(root) {
+    const s = subCallSummary(root, this.signer, (c) => this.#token(c));
+    return this.#t('summaryLine', {
+      lead: this.#summaryLine(root.fn),
+      payments: s.payments.map((p) => this.#t('summaryPayment', this.#payment(p))),
+      more: s.more ? `<button type="button" class="more-calls" data-act="details" part="summary-more">${this.#t('summaryMore', { count: s.more })}</button>` : null,
+    });
   }
 
   #summaryHtml() {
     const op = this.#decoded.op;
     const cmp = this.#comparison;
     const lines = this.#entries.length
-      ? this.#entries.map((e, i) => `<li>${this.#summaryLine(e.root.fn)}${cmp?.entries[i]?.status === 'extra' ? ` <span class="badge bad">${this.#t('summaryUnusedTag')}</span>` : ''}</li>`)
+      ? this.#entries.map((e, i) => `<li>${this.#summaryEntry(e.root)}${cmp?.entries[i]?.status === 'extra' ? ` <span class="badge bad">${this.#t('summaryUnusedTag')}</span>` : ''}</li>`)
       : op?.type === 'invoke' ? [`<li>${this.#summaryLine(op.hostFunction)}</li>`] : [`<li>${this.#t('operation', { type: esc(op?.type ?? 'unknown') })}</li>`];
     const budgets = (this.#previewState === 'done' ? this.#preview.budgets ?? [] : []).map((b) => {
       const tok = this.#assetToken(b.token);
@@ -684,7 +694,14 @@ export class SorobanSignDialog extends Base {
     const act = e.target.closest?.('[data-act]')?.dataset.act;
     if (act === 'reject') this.#finish('rejected');
     else if (act === 'preview') this.runPreview();
-    else if (act === 'approve') {
+    else if (act === 'details') {
+      const more = this.dialog.querySelector('details[part="details"]');
+      if (!more) return;
+      more.open = true;
+      this.#detailsOpen = true;
+      more.querySelector('summary')?.focus();
+      more.scrollIntoView?.({ block: 'nearest' });
+    } else if (act === 'approve') {
       if (this.#flags().length && !this.#confirming) {
         this.#confirming = true;
         this.#render();
