@@ -1,0 +1,33 @@
+{
+  "purpose": "Opt-in, shadow-budget differential-test observations; host algorithms unchanged.",
+  "files": {
+    "src/auth.rs": {
+      "upstream_sha256": "8307d3aeaf9c1a7c8199d2107714aff9c298ae299475ec4470ad28ead446e91b",
+      "patched_sha256": "79eb2a57b1118fd7e8ccb54e2af5204ebf358b5378ce8a6fe1c19a19767d3816"
+    },
+    "src/host/inspection.rs": {
+      "upstream_sha256": null,
+      "patched_sha256": "565e470c9036a5c0df1b7c2175b1c4a45015bdcccd60f09bd651f3f09ff6dcdb"
+    },
+    "src/host/trace/fmt.rs": {
+      "upstream_sha256": "0436f0f15540985f007b728d426470218ea463ed8b1dde23dedee0c08b986b07",
+      "patched_sha256": "2df53b4f15bcfa15d6788999db849f03a19a386c032fa522c5b91f182434f624"
+    },
+    "src/host/trace.rs": {
+      "upstream_sha256": "6de79ddfdcc146c188a6f340329d9ec62dfe7cfea46a534b3d8734e487855226",
+      "patched_sha256": "0d57ef167627746332cbf0f3979033dc91e2a5a4eec78f44cd9d4e44becee076"
+    },
+    "src/host.rs": {
+      "upstream_sha256": "29dab11703256fe8fa58cf1f76556540325a8ca55beec6f75b75539d0d74f44e",
+      "patched_sha256": "25e6ff7b9103e06e713f9fcd74b304a11698818c38c2af9d7ccc5b9fae3439cf"
+    },
+    "src/lib.rs": {
+      "upstream_sha256": "066328815dd01b7616d29bf56f74cf089c53cac95ae66910b44a56befe931cbb",
+      "patched_sha256": "323aac3cc3bee11d4637b53b53283668896521b173ca0629e28f09a7aa6a9526"
+    },
+    "src/storage.rs": {
+      "upstream_sha256": "03831101eefc0fa9957ec690152f932aec42b3f9b7282e4a60da813dd756e3aa",
+      "patched_sha256": "13fbb8c77aa180cd65f59900f5b898f7e2617e9061fe9fadc17129b327314d12"
+    }
+  }
+}

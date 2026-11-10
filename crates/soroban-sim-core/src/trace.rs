@@ -22,7 +22,12 @@
 
 use anyhow::{anyhow, Result};
 use soroban_env_host::budget::{AsBudget, Budget};
-use soroban_env_host::e2e_invoke::{self, TtlLedgerEntryMeta};
+use soroban_env_host::e2e_invoke;
+use crate::host;
+#[path = "host_adapter.rs"]
+#[allow(clippy::duplicate_mod)] // Each instance binds to a different host crate identity.
+mod adapter;
+use adapter::TtlLedgerEntryMeta;
 use soroban_env_host::storage::SnapshotSource;
 use soroban_env_host::xdr::{
     DiagnosticEvent, LedgerEntryData, LedgerKey, Limits, ReadXdr, ScVal,
@@ -246,7 +251,7 @@ fn replay_with_trace(core: &SimulationCore) -> std::result::Result<Vec<TraceStep
     });
 
     let mut diagnostic_events: Vec<DiagnosticEvent> = Vec::new();
-    let replay = e2e_invoke::invoke_host_function(
+    let replay = adapter::invoke_host_function(
         &budget,
         core.enable_diagnostics,
         encoded_host_fn,

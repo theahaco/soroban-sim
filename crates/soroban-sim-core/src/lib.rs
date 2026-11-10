@@ -1,3 +1,33 @@
+// A build selects one coherent host/simulation/XDR line. Never coerce a fork's protocol.
+#[cfg(any(all(feature = "host-p27", feature = "host-p29"), all(feature = "host-p27", feature = "host-p30"), all(feature = "host-p29", feature = "host-p30")))]
+compile_error!("select exactly one of host-p27, host-p29, host-p30 (disable default features first)");
+#[cfg(not(any(feature = "host-p27", feature = "host-p29", feature = "host-p30")))]
+compile_error!("select one of host-p27, host-p29, host-p30");
+#[cfg(any(all(feature = "exact-apply", feature = "exact-apply-p27"), all(feature = "exact-apply", feature = "exact-apply-p30"), all(feature = "exact-apply-p27", feature = "exact-apply-p30")))]
+compile_error!("select at most one of exact-apply, exact-apply-p27, exact-apply-p30");
+#[cfg(all(feature = "exact-apply", not(feature = "host-p29")))]
+compile_error!("exact-apply is the host-p29 application host; use exact-apply-p27 with host-p27 or exact-apply-p30 with host-p30");
+#[cfg(all(feature = "exact-apply-p27", not(feature = "host-p27")))]
+compile_error!("exact-apply-p27 requires host-p27");
+#[cfg(all(feature = "exact-apply-p30", not(feature = "host-p30")))]
+compile_error!("exact-apply-p30 requires host-p30");
+#[cfg(feature = "host-p27")]
+pub extern crate soroban_env_host_p27 as soroban_env_host;
+#[cfg(feature = "host-p30")]
+pub extern crate soroban_env_host_p30 as soroban_env_host;
+#[cfg(feature = "host-p27")]
+pub extern crate soroban_simulation_p27 as soroban_simulation;
+#[cfg(feature = "host-p30")]
+pub extern crate soroban_simulation_p30 as soroban_simulation;
+#[cfg(feature = "exact-apply-p27")]
+extern crate soroban_env_host_apply_p27 as soroban_env_host_apply;
+#[cfg(feature = "exact-apply-p30")]
+extern crate soroban_env_host_apply_p30 as soroban_env_host_apply;
+/// The selected host, including its matching XDR types.
+pub use soroban_env_host as host;
+/// The selected simulation library.
+pub use soroban_simulation as simulation;
+
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use soroban_env_host::e2e_invoke::RecordingInvocationAuthMode;

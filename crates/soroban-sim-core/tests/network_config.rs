@@ -15,7 +15,7 @@
 //!    into the needs-state buffer means needs-state, and the buffer is
 //!    authoritative, so a non-Storage `ExceededLimit` must not false-positive.
 
-use soroban_env_host::xdr::{
+use soroban_sim_core::host::xdr::{
     ConfigSettingContractBandwidthV0, ConfigSettingContractComputeV0, ConfigSettingContractEventsV0,
     ConfigSettingContractHistoricalDataV0, ConfigSettingContractLedgerCostExtV0,
     ConfigSettingContractLedgerCostV0, ConfigSettingEntry, LedgerEntry, LedgerEntryData,

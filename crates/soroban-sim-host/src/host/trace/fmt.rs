@@ -5,6 +5,7 @@ use core::fmt::{Debug, Display};
 impl Debug for TraceEvent<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TraceEvent::Inspection(e) => write!(f, "inspection {e:?}"),
             TraceEvent::Begin => write!(f, "TraceEvent::Begin"),
             TraceEvent::PushCtx(..) => write!(f, "TraceEvent::PushCtx(...)"),
             TraceEvent::PopCtx(..) => write!(f, "TraceEvent::PopCtx(...)"),
@@ -150,6 +151,7 @@ impl TraceEvent<'_> {
 impl Display for TraceEvent<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TraceEvent::Inspection(e) => write!(f, "inspection {e:?}"),
             TraceEvent::PushCtx(ctx) => {
                 let (frameid, args) = Self::frame_id_and_args(&ctx.frame);
                 write!(f, "push {frameid}(")?;

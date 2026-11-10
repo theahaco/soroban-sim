@@ -124,7 +124,7 @@ pub fn replay(tx: &ReplayTx) -> Result<ReplayOutcome> {
     let source = StaticSource::new(fork.ledger_seq, base.values().cloned().collect())?;
     let mut session = Session::new(Box::new(source), fork, SessionOptions::new(&tx.network_passphrase)).context("forking the pre-state")?;
     session.set_close_time(tx.close_time);
-    let options = SubmitOptions { lane_base_fee: Some(tx.component_base_fee.unwrap_or(i64::MAX)), prng_seed: Some(tx.prng_seed) };
+    let options = SubmitOptions { lane_base_fee: Some(tx.component_base_fee.unwrap_or(i64::MAX)), prng_seed: Some(tx.prng_seed), ..Default::default() };
     let record = session.submit_with("replay", &tx.envelope, &options)?;
 
     let (label, contract) = describe(&tx.envelope);

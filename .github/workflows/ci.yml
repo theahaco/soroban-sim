@@ -9,6 +9,27 @@ permissions:
   contents: read
 
 jobs:
+  host-lines:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - protocol: 27
+            exact: exact-apply-p27
+          - protocol: 29
+            exact: exact-apply
+          - protocol: 30
+            exact: exact-apply-p30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: host-p${{ matrix.protocol }}
+      - run: cargo test -p soroban-sim-core --locked --no-default-features --features host-p${{ matrix.protocol }},${{ matrix.exact }}
+      - run: cargo check -p soroban-sim-core --locked --no-default-features --features host-p${{ matrix.protocol }}
+
   release-inputs:
     runs-on: ubuntu-latest
     steps:

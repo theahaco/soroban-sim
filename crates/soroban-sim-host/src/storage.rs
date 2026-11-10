@@ -304,16 +304,23 @@ impl Storage {
         }
     }
 
+    #[allow(clippy::redundant_closure_call)] // Preserve upstream early returns while observing the result.
     pub(crate) fn try_get_full(
         &mut self,
         key: &Rc<LedgerKey>,
         host: &Host,
         key_val: Option<Val>,
     ) -> Result<Option<EntryWithLiveUntil>, HostError> {
+        let observation_key = key.clone();
+        let result = (|| {
         let res = self
             .try_get_full_helper(key, host)
             .map_err(|e| host.decorate_storage_error(e, key.as_ref(), key_val))?;
         Ok(res)
+
+        })();
+        host.observe(|| Ok(crate::inspection::Event::LedgerStorage { operation: "get", key: observation_key.as_ref().clone(), succeeded: result.is_ok() }));
+        result
     }
 
     pub(crate) fn get(
@@ -422,6 +429,7 @@ impl Storage {
     /// In [FootprintMode::Enforcing] mode, succeeds only if the written
     /// [LedgerKey] has been declared in the [Footprint] as
     /// [AccessType::ReadWrite].
+    #[allow(clippy::redundant_closure_call)] // Preserve upstream early returns while observing the result.
     pub(crate) fn put(
         &mut self,
         key: &Rc<LedgerKey>,
@@ -430,8 +438,14 @@ impl Storage {
         host: &Host,
         key_val: Option<Val>,
     ) -> Result<(), HostError> {
+        let observation_key = key.clone();
+        let result = (|| {
         let _span = tracy_span!("storage put");
         self.put_opt(key, Some((val.clone(), live_until_ledger)), host, key_val)
+
+        })();
+        host.observe(|| Ok(crate::inspection::Event::LedgerStorage { operation: "put", key: observation_key.as_ref().clone(), succeeded: result.is_ok() }));
+        result
     }
 
     /// Attempts to delete the [LedgerEntry] associated with a given [LedgerKey]
@@ -443,15 +457,22 @@ impl Storage {
     /// In [FootprintMode::Enforcing] mode, succeeds only if the deleted
     /// [LedgerKey] has been declared in the [Footprint] as
     /// [AccessType::ReadWrite].
+    #[allow(clippy::redundant_closure_call)] // Preserve upstream early returns while observing the result.
     pub(crate) fn del(
         &mut self,
         key: &Rc<LedgerKey>,
         host: &Host,
         key_val: Option<Val>,
     ) -> Result<(), HostError> {
+        let observation_key = key.clone();
+        let result = (|| {
         let _span = tracy_span!("storage del");
         self.put_opt(key, None, host, key_val)
             .map_err(|e| host.decorate_storage_error(e, key.as_ref(), key_val))
+
+        })();
+        host.observe(|| Ok(crate::inspection::Event::LedgerStorage { operation: "delete", key: observation_key.as_ref().clone(), succeeded: result.is_ok() }));
+        result
     }
 
     /// Attempts to determine the presence of a [LedgerEntry] associated with a
@@ -463,17 +484,24 @@ impl Storage {
     ///
     /// In [FootprintMode::Enforcing] mode, succeeds only if the access has been
     /// declared in the [Footprint].
+    #[allow(clippy::redundant_closure_call)] // Preserve upstream early returns while observing the result.
     pub(crate) fn has(
         &mut self,
         key: &Rc<LedgerKey>,
         host: &Host,
         key_val: Option<Val>,
     ) -> Result<bool, HostError> {
+        let observation_key = key.clone();
+        let result = (|| {
         let _span = tracy_span!("storage has");
         let res = self
             .try_get_host_ledger_entry(key, host)
             .map_err(|e| host.decorate_storage_error(e, key.as_ref(), key_val))?;
         Ok(res.is_some())
+
+        })();
+        host.observe(|| Ok(crate::inspection::Event::LedgerStorage { operation: "has", key: observation_key.as_ref().clone(), succeeded: result.is_ok() }));
+        result
     }
 
     /// Common setup for TTL extension operations. Returns the entry info
@@ -586,6 +614,7 @@ impl Storage {
     ///
     /// This operation does not modify any ledger entries, but does change the
     /// internal storage.
+    #[allow(clippy::redundant_closure_call)] // Preserve upstream early returns while observing the result.
     pub(crate) fn extend_ttl(
         &mut self,
         host: &Host,
@@ -594,6 +623,8 @@ impl Storage {
         extend_to: u32,
         key_val: Option<Val>,
     ) -> Result<(), HostError> {
+        let observation_key = key.clone();
+        let result = (|| {
         let _span = tracy_span!("extend key");
 
         if threshold > extend_to {
@@ -620,6 +651,10 @@ impl Storage {
             self.apply_ttl_extension(host, key, ttl_ext_info, new_live_until)?;
         }
         Ok(())
+
+        })();
+        host.observe(|| Ok(crate::inspection::Event::LedgerStorage { operation: "extend_ttl", key: observation_key.as_ref().clone(), succeeded: result.is_ok() }));
+        result
     }
 
     /// Extends TTL of a ledger entry with min/max extension controls.
@@ -640,6 +675,7 @@ impl Storage {
     ///
     /// This operation does not modify any ledger entries, but does change the
     /// internal storage.
+    #[allow(clippy::redundant_closure_call)] // Preserve upstream early returns while observing the result.
     pub(crate) fn extend_ttl_v2(
         &mut self,
         host: &Host,
@@ -649,6 +685,8 @@ impl Storage {
         max_extension: u32,
         key_val: Option<Val>,
     ) -> Result<(), HostError> {
+        let observation_key = key.clone();
+        let result = (|| {
         let _span = tracy_span!("extend key v2");
 
         if max_extension < min_extension {
@@ -689,6 +727,10 @@ impl Storage {
             })?;
 
         self.apply_ttl_extension(host, key, ttl_ext_info, new_live_until)
+
+        })();
+        host.observe(|| Ok(crate::inspection::Event::LedgerStorage { operation: "extend_ttl_v2", key: observation_key.as_ref().clone(), succeeded: result.is_ok() }));
+        result
     }
 
     #[cfg(any(test, feature = "recording_mode"))]

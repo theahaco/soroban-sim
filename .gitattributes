@@ -1,6 +1,8 @@
-# Keep the unchanged compatibility host distinct from maintained release code.
-crates/soroban-sim-host/src/** linguist-vendored -whitespace
-crates/soroban-sim-host/build.rs linguist-vendored -whitespace
+# Keep upstream host copies distinct from maintained release code.
+crates/soroban-sim-host*/src/** linguist-vendored -whitespace
+crates/soroban-sim-host*/build.rs linguist-vendored -whitespace
+# The new observation module is maintained simulator code.
+crates/soroban-sim-host*/src/host/inspection.rs -linguist-vendored
 # Package copies are generated from the repository's authoring sources.
 crates/soroban-sim-*/fixtures/** linguist-generated
 crates/soroban-sim-cli/examples/session/** linguist-generated

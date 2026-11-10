@@ -42,6 +42,7 @@ pub(crate) mod metered_xdr;
 mod num;
 pub(crate) mod prng;
 pub(crate) mod trace;
+pub mod inspection;
 mod validity;
 
 pub use error::{ErrorHandler, HostError};
@@ -2073,6 +2074,7 @@ impl VmCallerEnv for Host {
     // region: "ledger" module functions
 
     // Notes on metering: covered by components
+    #[allow(clippy::redundant_closure_call)] // Observe the unmodified upstream body, including early returns.
     fn put_contract_data(
         &self,
         _vmcaller: &mut VmCaller<Host>,
@@ -2080,6 +2082,7 @@ impl VmCallerEnv for Host {
         v: Val,
         t: StorageType,
     ) -> Result<Void, HostError> {
+        let result = (|| {
         self.validate_put_contract_data(k, v, t)?;
         match t {
             StorageType::Temporary | StorageType::Persistent => {
@@ -2092,15 +2095,21 @@ impl VmCallerEnv for Host {
         };
 
         Ok(Val::VOID)
+
+        })();
+        if matches!(t, StorageType::Instance) { self.observe_storage("put_contract_data", k, t, result.is_ok()); }
+        result
     }
 
     // Notes on metering: covered by components
+    #[allow(clippy::redundant_closure_call)] // Observe the unmodified upstream body, including early returns.
     fn has_contract_data(
         &self,
         _vmcaller: &mut VmCaller<Host>,
         k: Val,
         t: StorageType,
     ) -> Result<Bool, HostError> {
+        let result = (|| {
         let res = match t {
             StorageType::Temporary | StorageType::Persistent => {
                 let key = self.storage_key_from_val(k, t.try_into()?)?;
@@ -2112,15 +2121,21 @@ impl VmCallerEnv for Host {
         };
 
         Ok(Val::from_bool(res))
+
+        })();
+        if matches!(t, StorageType::Instance) { self.observe_storage("has_contract_data", k, t, result.is_ok()); }
+        result
     }
 
     // Notes on metering: covered by components
+    #[allow(clippy::redundant_closure_call)] // Observe the unmodified upstream body, including early returns.
     fn get_contract_data(
         &self,
         _vmcaller: &mut VmCaller<Host>,
         k: Val,
         t: StorageType,
     ) -> Result<Val, HostError> {
+        let result = (|| {
         match t {
             StorageType::Temporary | StorageType::Persistent => {
                 let key = self.storage_key_from_val(k, t.try_into()?)?;
@@ -2149,15 +2164,21 @@ impl VmCallerEnv for Host {
                     .copied()
             }),
         }
+
+        })();
+        if matches!(t, StorageType::Instance) { self.observe_storage("get_contract_data", k, t, result.is_ok()); }
+        result
     }
 
     // Notes on metering: covered by components
+    #[allow(clippy::redundant_closure_call)] // Observe the unmodified upstream body, including early returns.
     fn del_contract_data(
         &self,
         _vmcaller: &mut VmCaller<Host>,
         k: Val,
         t: StorageType,
     ) -> Result<Void, HostError> {
+        let result = (|| {
         self.validate_del_contract_data(k, t)?;
         match t {
             StorageType::Temporary | StorageType::Persistent => {
@@ -2175,6 +2196,10 @@ impl VmCallerEnv for Host {
         }
 
         Ok(Val::VOID)
+
+        })();
+        if matches!(t, StorageType::Instance) { self.observe_storage("del_contract_data", k, t, result.is_ok()); }
+        result
     }
 
     // Notes on metering: covered by components

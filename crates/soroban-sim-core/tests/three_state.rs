@@ -9,7 +9,7 @@
 //! contract code -> the storage entries the function touches. The source account is
 //! NOT read for a plain contract invocation, so it never appears in needs-state.
 
-use soroban_env_host::xdr::{ContractDataDurability, LedgerKey, Limits, ReadXdr, ScMap, ScVal, WriteXdr};
+use soroban_sim_core::host::xdr::{ContractDataDurability, LedgerKey, Limits, ReadXdr, ScMap, ScVal, WriteXdr};
 use soroban_sim_core::*;
 
 /// `fixture_ledger_info().sequence_number`.
@@ -19,7 +19,7 @@ const LIVE: u32 = 1_500_000;
 
 // --- small builders ---------------------------------------------------------
 
-fn p(entry: soroban_env_host::xdr::LedgerEntry, ttl: u32) -> LedgerEntryWithLiveUntil {
+fn p(entry: soroban_sim_core::host::xdr::LedgerEntry, ttl: u32) -> LedgerEntryWithLiveUntil {
     LedgerEntryWithLiveUntil {
         entry,
         live_until_ledger: Some(ttl),
@@ -46,7 +46,7 @@ fn xdr(key: &LedgerKey) -> Vec<u8> {
 }
 
 fn run(
-    hf: soroban_env_host::xdr::HostFunction,
+    hf: soroban_sim_core::host::xdr::HostFunction,
     entries: Vec<LedgerEntryWithLiveUntil>,
     absent: Vec<LedgerKey>,
     policy: UnmappedPolicy,
@@ -275,7 +275,7 @@ fn genuine_contract_failure_is_complete_not_needs_state() {
 /// Drive the rerun protocol: start empty, resolve each NeedsState key against an
 /// oracle (present if the oracle has it, otherwise known-absent) until Complete.
 fn drive_to_complete(
-    hf: soroban_env_host::xdr::HostFunction,
+    hf: soroban_sim_core::host::xdr::HostFunction,
     oracle: &[LedgerEntryWithLiveUntil],
 ) -> Vec<u8> {
     let mut present: Vec<LedgerEntryWithLiveUntil> = Vec::new();
@@ -302,7 +302,7 @@ fn drive_to_complete(
     panic!("iterative refetch did not converge within the iteration budget");
 }
 
-fn single_complete_run(hf: soroban_env_host::xdr::HostFunction, oracle: Vec<LedgerEntryWithLiveUntil>) -> Vec<u8> {
+fn single_complete_run(hf: soroban_sim_core::host::xdr::HostFunction, oracle: Vec<LedgerEntryWithLiveUntil>) -> Vec<u8> {
     // Explicit complete snapshot: every present entry supplied, Absent policy for
     // anything else (there is nothing else to read).
     expect_complete(run(hf, oracle, vec![], UnmappedPolicy::Absent))

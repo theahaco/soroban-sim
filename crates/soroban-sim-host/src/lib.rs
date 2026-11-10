@@ -52,6 +52,7 @@ pub mod e2e_invoke;
 pub mod fees;
 
 #[doc(hidden)]
+pub use host::inspection;
 pub use host::{TraceEvent, TraceHook, TraceRecord, TraceState};
 
 #[cfg(feature = "bench")]

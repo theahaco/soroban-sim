@@ -31,9 +31,15 @@ def main():
     nodes = {n["id"]: n for n in metadata["resolve"]["nodes"]}
     if any(p["source"] and p["source"].startswith("git+") for p in metadata["packages"]):
         raise SystemExit("Release dependency graph still contains Git-only sources")
-    host = next(p for p in members if p["name"] == "soroban-sim-host")
-    if "recording_mode" in nodes[host["id"]]["features"]:
-        raise SystemExit("The isolated application host has recording_mode enabled")
+    for host in (p for p in members if p["name"].startswith("soroban-sim-host")):
+        if any(feature in nodes[host["id"]]["features"] for feature in ("recording_mode", "testutils")):
+            raise SystemExit(f"The isolated application host {host['name']} has recording/test features enabled")
+    host_only = [["-p", "soroban-sim-component"], ["-p", "soroban-sim-facade"]]
+    host_only += [["-p", "soroban-sim-core", "--no-default-features", "--features", f"host-p{line}"] for line in (27, 29, 30)]
+    for selection in host_only:
+        tree = subprocess.check_output(["cargo", "tree", "--locked", "--edges", "normal,build", "--prefix", "none", *selection], cwd=ROOT, text=True)
+        if any(line.split()[0].startswith("soroban-sim-host") for line in tree.splitlines() if line.strip()):
+            raise SystemExit(f"Build without exact-apply depends on an isolated application host: {' '.join(selection)}")
     package_args = ["cargo", "package", "--workspace", "--locked"]
     if args.allow_dirty:
         package_args.append("--allow-dirty")
@@ -59,6 +65,8 @@ def main():
         # can reuse a binary pointing at an earlier, deleted extraction folder.
         env = dict(os.environ, CARGO_TARGET_DIR=str(isolated / "target"))
         run("cargo", "test", "--workspace", "--exclude", "soroban-sim-host", "--locked", cwd=isolated, env=env)
+        for line in (27, 30):
+            run("cargo", "test", "-p", "soroban-sim-core", "--no-default-features", "--features", f"host-p{line},exact-apply-p{line}", "--locked", cwd=isolated, env=env)
         run("cargo", "build", "-p", "soroban-sim-component", "--target", "wasm32-wasip2", "--release", "--locked", cwd=isolated, env=env)
         # Use Cargo's actual install interface against the normalized CLI package.
         destination = isolated / "installed"

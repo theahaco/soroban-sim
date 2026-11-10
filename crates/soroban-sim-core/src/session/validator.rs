@@ -14,7 +14,7 @@ use soroban_env_host::xdr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountEntryExtensionV2Ext,
     AccountId, AlphaNum12, AlphaNum4, Asset, ConfigSettingEntry, ConfigSettingId, ContractIdPreimage,
     DecoratedSignature, FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionInnerTx, Hash,
-    HostFunction, InvokeHostFunctionOp, LedgerEntryData, LedgerKey, LedgerKeyConfigSetting, Limits, Memo,
+    HostFunction, LedgerEntryData, LedgerKey, LedgerKeyConfigSetting, Limits, Memo,
     MuxedAccount, OperationBody, Preconditions, PublicKey, ScAddress, ScMap, ScVal, Signer, SignerKey,
     SignerKeyEd25519SignedPayload, SorobanAuthorizationEntry, SorobanCredentials, SorobanDelegateSignature,
     SorobanTransactionData, SorobanTransactionDataExt, Transaction, TransactionEnvelope,
@@ -243,7 +243,7 @@ pub struct ValidTx {
     /// The transaction's sequence number: the source's sequence after apply.
     pub seq_num: i64,
     pub op_source: AccountId,
-    pub op: InvokeHostFunctionOp,
+    pub op: OperationBody,
     pub data: SorobanTransactionData,
     pub fees: Fees,
     /// The (inner) envelope's size, which the resource fee is computed on.
@@ -457,25 +457,23 @@ impl TxValidator<'_> {
             _ => return reject(TxCode::Malformed, "a Soroban transaction has exactly one operation"),
         };
         let ihf = match &op.body {
-            OperationBody::InvokeHostFunction(ihf) => ihf,
-            OperationBody::ExtendFootprintTtl(_) | OperationBody::RestoreFootprint(_) => {
-                return reject(TxCode::NotSupported, format!("{} operations are not supported yet", op.body.name()))
-            }
+            OperationBody::InvokeHostFunction(ihf) => Some(ihf),
+            OperationBody::ExtendFootprintTtl(_) | OperationBody::RestoreFootprint(_) => None,
             _ => return reject(TxCode::Malformed, "Soroban transaction data on a classic operation"),
         };
         // Since protocol 25 an InvokeHostFunction transaction may not carry a
         // memo or a muxed source.
         let muxed = |m: &MuxedAccount| matches!(m, MuxedAccount::MuxedEd25519(_));
-        if !matches!(tx.memo, Memo::None) || muxed(&tx.source_account) || op.source_account.as_ref().is_some_and(muxed) {
+        if ihf.is_some() && (!matches!(tx.memo, Memo::None) || muxed(&tx.source_account) || op.source_account.as_ref().is_some_and(muxed)) {
             return reject(TxCode::SorobanInvalid, "Soroban transactions may not use a memo or a muxed source account");
         }
-        if let Some(r) = self.check_resources(data, size_bytes) {
+        if let Some(r) = self.check_resources(data, size_bytes, matches!(op.body, OperationBody::RestoreFootprint(_))) {
             return Ok(Err(r));
         }
         if charge_fee && data.resource_fee > tx.fee as i64 {
             return reject(TxCode::SorobanInvalid, format!("resource fee {} is above the full fee {}", data.resource_fee, tx.fee));
         }
-        let (non_refundable, _) = compute_transaction_resource_fee(&declared_resources(data, size_bytes), &self.config.fee_configuration);
+        let (non_refundable, _) = compute_transaction_resource_fee(&declared_resources_for(data, size_bytes, matches!(op.body, OperationBody::RestoreFootprint(_))), &self.config.fee_configuration);
         if data.resource_fee < non_refundable {
             return reject(
                 TxCode::SorobanInvalid,
@@ -591,20 +589,36 @@ impl TxValidator<'_> {
                 None => return reject(TxCode::NoAccount, format!("operation source {op_source} does not exist")),
             }
         };
-        let med = op_account.thresholds.0[2] as u32;
+        let med = op_account.thresholds.0[if ihf.is_some() { 2 } else { 1 }] as u32;
         if !checker.check(&op_source, &account_signers(&op_account), med) {
-            return reject(TxCode::OpBadAuth, threshold_miss(&op_source, "medium", med));
+            return reject(TxCode::OpBadAuth, threshold_miss(&op_source, if ihf.is_some() { "medium" } else { "low" }, med));
         }
-        if let Some(why) = self.check_host_function(&ihf.host_function) {
-            return reject(TxCode::OpMalformed, why);
-        }
+        let malformed = match &op.body {
+            OperationBody::InvokeHostFunction(ihf) => self.check_host_function(&ihf.host_function),
+            OperationBody::ExtendFootprintTtl(extend) => {
+                let fp = &data.resources.footprint;
+                if !fp.read_write.is_empty() || fp.read_only.iter().any(|k| !matches!(k, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))) {
+                    Some("TTL extension requires only Soroban read-only keys".into())
+                } else if extend.extend_to >= self.info.max_entry_ttl || self.info.sequence_number.checked_add(extend.extend_to).is_none() {
+                    Some("TTL extension exceeds the maximum entry TTL".into())
+                } else { None }
+            }
+            OperationBody::RestoreFootprint(_) => {
+                let fp = &data.resources.footprint;
+                if !fp.read_only.is_empty() || fp.read_write.iter().any(|k| !is_persistent_key(k)) {
+                    Some("restore requires only persistent read-write keys".into())
+                } else { None }
+            }
+            _ => unreachable!(),
+        };
+        if let Some(why) = malformed { return reject(TxCode::OpMalformed, why); }
         if let Some(unused) = checker.unused() {
             return reject(TxCode::BadAuthExtra, format!("signature {unused} matches no signer that was needed"));
         }
 
         let mut replayable = self.replayable(&checker.matched)?;
-        for entry in ihf.auth.iter() {
-            replayable.extend(self.auth_replayable(entry)?);
+        if let Some(ihf) = ihf {
+            for entry in ihf.auth.iter() { replayable.extend(self.auth_replayable(entry)?); }
         }
         Ok(Ok(ValidTx {
             hash,
@@ -613,7 +627,7 @@ impl TxValidator<'_> {
             fee_source: source,
             seq_num: tx.seq_num.0,
             op_source,
-            op: ihf.clone(),
+            op: op.body.clone(),
             data: data.clone(),
             fees,
             size_bytes,
@@ -639,12 +653,12 @@ impl TxValidator<'_> {
     }
 
     /// stellar-core's per-transaction Soroban resource limits.
-    fn check_resources(&self, data: &SorobanTransactionData, size_bytes: u32) -> Option<Rejection> {
+    fn check_resources(&self, data: &SorobanTransactionData, size_bytes: u32, restore: bool) -> Option<Rejection> {
         let invalid = |detail: String| Some(Rejection { code: TxCode::SorobanInvalid, detail, fee_bump_inner: false });
         let r = &data.resources;
         let l = self.limits;
         let fp = &r.footprint;
-        let declared = declared_resources(data, size_bytes);
+        let declared = declared_resources_for(data, size_bytes, restore);
         let footprint_entries = (fp.read_only.len() + fp.read_write.len()) as u32;
         let checks = [
             ("instructions", r.instructions as u64, l.tx_max_instructions),
@@ -849,6 +863,10 @@ fn threshold_miss(account: &AccountId, level: &str, threshold: u32) -> String {
 /// Since protocol 23 only classic entries and restored archived entries are
 /// disk reads.
 pub fn declared_resources(data: &SorobanTransactionData, size_bytes: u32) -> TransactionResources {
+    declared_resources_for(data, size_bytes, false)
+}
+
+fn declared_resources_for(data: &SorobanTransactionData, size_bytes: u32, restore: bool) -> TransactionResources {
     let r = &data.resources;
     let classic = |k: &&LedgerKey| !matches!(k, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_));
     let restored = match &data.ext {
@@ -857,9 +875,9 @@ pub fn declared_resources(data: &SorobanTransactionData, size_bytes: u32) -> Tra
     };
     TransactionResources {
         instructions: r.instructions,
-        disk_read_entries: r.footprint.read_only.iter().filter(classic).count() as u32
+        disk_read_entries: if restore { r.footprint.read_write.len() as u32 } else { r.footprint.read_only.iter().filter(classic).count() as u32
             + r.footprint.read_write.iter().filter(classic).count() as u32
-            + restored,
+            + restored },
         write_entries: r.footprint.read_write.len() as u32,
         disk_read_bytes: r.disk_read_bytes,
         write_bytes: r.write_bytes,

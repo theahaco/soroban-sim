@@ -14,6 +14,16 @@ semver_check = false
 git_release_latest = false
 
 [[package]]
+name = "soroban-sim-host-p27"
+semver_check = false
+git_release_latest = false
+
+[[package]]
+name = "soroban-sim-host-p30"
+semver_check = false
+git_release_latest = false
+
+[[package]]
 name = "soroban-sim-core"
 version_group = "sim"
 git_release_latest = false

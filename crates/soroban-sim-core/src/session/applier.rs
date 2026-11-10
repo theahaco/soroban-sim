@@ -16,17 +16,21 @@ use soroban_env_host::xdr::{
 use soroban_simulation::NetworkConfig;
 use std::collections::BTreeSet;
 
-// The host transactions apply with. With `exact-apply` (the default) it is a
+// The host transactions apply with. With an exact-apply feature (the default) it is a
 // separate build of the same release without `recording_mode`, metered
 // exactly as stellar-core's; without it, the shared recording-mode build.
-#[cfg(feature = "exact-apply")]
-use soroban_env_host_apply as host;
+#[cfg(exact_apply)]
+pub(super) use soroban_env_host_apply as host;
 /// Whether transactions apply with the exact-metering host build.
-pub const EXACT_APPLY: bool = cfg!(feature = "exact-apply");
-#[cfg(not(feature = "exact-apply"))]
+pub const EXACT_APPLY: bool = cfg!(exact_apply);
+#[cfg(not(exact_apply))]
 use soroban_env_host as host;
 use host::budget::Budget;
-use host::e2e_invoke::{self, TtlLedgerEntryMeta};
+use host::e2e_invoke;
+#[path = "../host_adapter.rs"]
+#[allow(clippy::duplicate_mod)] // Each instance binds to a different host crate identity.
+mod adapter;
+use adapter::TtlLedgerEntryMeta;
 use host::fees::{compute_rent_fee, compute_transaction_resource_fee, FeeConfiguration, RentFeeConfiguration, TransactionResources};
 use host::{Host, ModuleCache, DEFAULT_XDR_RW_LIMITS};
 
@@ -42,11 +46,19 @@ pub enum OpFailure {
     ResourceLimitExceeded,
     EntryArchived,
     InsufficientRefundableFee,
+    ExtendResourceLimitExceeded,
+    ExtendInsufficientRefundableFee,
+    RestoreResourceLimitExceeded,
+    RestoreInsufficientRefundableFee,
 }
 
 impl OpFailure {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::ExtendResourceLimitExceeded => "EXTEND_FOOTPRINT_TTL_RESOURCE_LIMIT_EXCEEDED",
+            Self::ExtendInsufficientRefundableFee => "EXTEND_FOOTPRINT_TTL_INSUFFICIENT_REFUNDABLE_FEE",
+            Self::RestoreResourceLimitExceeded => "RESTORE_FOOTPRINT_RESOURCE_LIMIT_EXCEEDED",
+            Self::RestoreInsufficientRefundableFee => "RESTORE_FOOTPRINT_INSUFFICIENT_REFUNDABLE_FEE",
             Self::Malformed => "INVOKE_HOST_FUNCTION_MALFORMED",
             Self::Trapped => "INVOKE_HOST_FUNCTION_TRAPPED",
             Self::ResourceLimitExceeded => "INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEEDED",
@@ -157,6 +169,7 @@ pub struct Applied {
     pub restored: u32,
     pub events: Vec<ContractEvent>,
     pub diagnostics: Vec<DiagnosticEvent>,
+    pub trace: Option<super::TransactionTrace>,
     pub metrics: Metrics,
     /// `sha256(InvokeHostFunctionSuccessPreImage)`: what core puts in the
     /// operation's success result.
@@ -213,8 +226,14 @@ impl Applier {
         Ok(())
     }
 
+    /// Apply without transaction inspection (the original application API).
     #[allow(clippy::too_many_arguments)]
-    pub fn apply(
+    pub fn apply(&mut self, ledger: &ForkedLedger, info: &soroban_env_host::LedgerInfo, config: &NetworkConfig, limits: &TxLimits, tx: &ValidTx, enable_diagnostics: bool, prng_seed: Option<[u8; 32]>) -> Result<Applied> {
+        self.apply_with_trace(ledger, info, config, limits, tx, enable_diagnostics, prng_seed, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn apply_with_trace(
         &mut self,
         ledger: &ForkedLedger,
         info: &soroban_env_host::LedgerInfo,
@@ -223,6 +242,7 @@ impl Applier {
         tx: &ValidTx,
         enable_diagnostics: bool,
         prng_seed: Option<[u8; 32]>,
+        trace: bool,
     ) -> Result<Applied> {
         let seq = info.sequence_number;
         // Fee, sequence number and one-time signers are consumed from here
@@ -257,8 +277,13 @@ impl Applier {
             restored: 0,
             events: vec![],
             diagnostics: vec![],
+            trace: None,
             metrics: Metrics::default(),
             success_hash: None,
+        };
+        let soroban_env_host::xdr::OperationBody::InvokeHostFunction(op) = &tx.op else {
+            self.tx_index += 1;
+            return self.apply_maintenance(ledger, info, config, limits, tx, applied);
         };
         let keys: Vec<LedgerKey> = r.footprint.read_only.iter().chain(r.footprint.read_write.iter()).cloned().collect();
         ledger.prefetch(&keys)?;
@@ -341,14 +366,20 @@ impl Applier {
         }
         applied.restored = restored.len() as u32;
 
-        let auth: Vec<Vec<u8>> = tx.op.auth.iter().map(|a| a.to_xdr(DEFAULT_XDR_RW_LIMITS)).collect::<Result<_, _>>()?;
+        let auth: Vec<Vec<u8>> = op.auth.iter().map(|a| a.to_xdr(DEFAULT_XDR_RW_LIMITS)).collect::<Result<_, _>>()?;
         let seed = prng_seed.unwrap_or_else(|| super::prng_seed(b"apply", seq, self.tx_index));
         self.tx_index += 1;
         let mut diagnostics = vec![];
-        let res = e2e_invoke::invoke_host_function(
+        #[cfg(exact_apply)]
+        let capture = trace.then(|| super::inspection::capture::hook(op.auth.as_slice()));
+        #[cfg(exact_apply)]
+        let hook = capture.as_ref().map(|c| c.0.clone());
+        #[cfg(not(exact_apply))]
+        let hook = { let _ = trace; None };
+        let res = adapter::invoke_host_function(
             &budget,
             enable_diagnostics,
-            tx.op.host_function.to_xdr(DEFAULT_XDR_RW_LIMITS)?,
+            op.host_function.to_xdr(DEFAULT_XDR_RW_LIMITS)?,
             r.to_xdr(DEFAULT_XDR_RW_LIMITS)?,
             &restored,
             tx.op_source.to_xdr(DEFAULT_XDR_RW_LIMITS)?,
@@ -357,9 +388,11 @@ impl Applier {
             entries.into_iter(),
             seed.to_vec(),
             &mut diagnostics,
-            None,
+            hook,
             Some(self.module_cache.clone()),
         );
+        #[cfg(exact_apply)]
+        if let Some((_, capture)) = capture { applied.trace = Some(capture.take()); }
         applied.cpu_insns = budget.get_cpu_insns_consumed()?;
         applied.mem_bytes = budget.get_mem_bytes_consumed()?;
         applied.metrics.cpu_insn = applied.cpu_insns;
@@ -463,7 +496,65 @@ impl Applier {
         self.refund(ledger, &tx.fee_source, refund, seq)?;
         applied.refund = refund;
         applied.fee_charged = fee - refund;
+        if let Some(trace) = &mut applied.trace { trace.finalize(true); }
         applied.result = Ok(value);
+        Ok(applied)
+    }
+
+    fn apply_maintenance(&self, ledger: &ForkedLedger, info: &soroban_env_host::LedgerInfo, config: &NetworkConfig, limits: &TxLimits, tx: &ValidTx, mut applied: Applied) -> Result<Applied> {
+        use host::fees::LedgerEntryRentChange;
+        use soroban_env_host::xdr::OperationBody;
+        let seq = info.sequence_number;
+        let r = &tx.data.resources;
+        let restore = matches!(tx.op, OperationBody::RestoreFootprint(_));
+        let (keys, target) = match &tx.op {
+            OperationBody::ExtendFootprintTtl(op) => (&r.footprint.read_only, seq.checked_add(op.extend_to)),
+            OperationBody::RestoreFootprint(_) => (&r.footprint.read_write, seq.checked_add(info.min_persistent_entry_ttl.saturating_sub(1))),
+            _ => unreachable!(),
+        };
+        let target = target.ok_or_else(|| anyhow!("TTL overflows ledger number"))?;
+        ledger.prefetch(keys.as_slice())?;
+        let size_budget = Budget::try_from_configs(0, 0, config.cpu_cost_params.clone(), config.memory_cost_params.clone())?;
+        let mut changes = vec![];
+        let mut rent = vec![];
+        let resource_failure = if restore { OpFailure::RestoreResourceLimitExceeded } else { OpFailure::ExtendResourceLimitExceeded };
+        for key in keys.iter() {
+            let Some(mut entry) = ledger.get(key)? else { continue };
+            let live_until = entry.live_until.ok_or_else(|| anyhow!("Soroban entry has no TTL"))?;
+            if restore && live_until >= seq || !restore && (live_until < seq || live_until >= target) { continue; }
+            let bytes = entry.entry.to_xdr(DEFAULT_XDR_RW_LIMITS)?.len() as u32;
+            if let Some(why) = limits.entry_too_big(key, bytes) {
+                return self.fail(ledger, tx, applied, seq, resource_failure, why);
+            }
+            let code = matches!(key, LedgerKey::ContractCode(_));
+            let key_size = key.to_xdr(DEFAULT_XDR_RW_LIMITS)?.len() as u32;
+            if restore {
+                applied.metrics.note_disk_read(code, key_size, bytes);
+                applied.metrics.note_write(code, key_size, bytes);
+                if applied.metrics.ledger_read_byte > r.disk_read_bytes || applied.metrics.ledger_write_byte > r.write_bytes {
+                    return self.fail(ledger, tx, applied, seq, resource_failure, "restore exceeds declared read/write bytes".into());
+                }
+            }
+            let size = e2e_invoke::entry_size_for_rent(&size_budget, &entry.entry, bytes)?;
+            rent.push(LedgerEntryRentChange { is_persistent: !is_temporary(&entry.entry), is_code_entry: code,
+                old_size_bytes: if restore { 0 } else { size }, new_size_bytes: size,
+                old_live_until_ledger: if restore { 0 } else { live_until }, new_live_until_ledger: target });
+            entry.live_until = Some(target);
+            if restore { entry.entry.last_modified_ledger_seq = seq; }
+            changes.push((key.clone(), entry));
+        }
+        applied.rent_fee = compute_rent_fee(&rent, &rent_fee_configuration(config), seq);
+        if applied.rent_fee > tx.fees.refundable {
+            let code = if restore { OpFailure::RestoreInsufficientRefundableFee } else { OpFailure::ExtendInsufficientRefundableFee };
+            return self.fail(ledger, tx, applied, seq, code, "rent exceeds refundable fee".into());
+        }
+        if restore { applied.restored = changes.len() as u32; applied.entries_written = changes.len() as u32; }
+        for (key, entry) in changes { ledger.put(key, Some(entry)); }
+        applied.write_bytes = applied.metrics.ledger_write_byte;
+        applied.refund = tx.fees.refundable - applied.rent_fee;
+        self.refund(ledger, &tx.fee_source, applied.refund, seq)?;
+        applied.fee_charged -= applied.refund;
+        applied.result = Ok(ScVal::Void);
         Ok(applied)
     }
 
@@ -475,6 +566,7 @@ impl Applier {
         applied.fee_charged = tx.fees.charged_up_front() - tx.fees.refundable;
         applied.rent_fee = 0;
         applied.events_fee = 0;
+        if let Some(trace) = &mut applied.trace { trace.finalize(false); }
         applied.result = Err(Failure { code, reason });
         Ok(applied)
     }

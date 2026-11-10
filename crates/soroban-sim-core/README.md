@@ -6,6 +6,7 @@ local transaction application.
 
 The default `exact-apply` feature uses the isolated `soroban-sim-host` package to
 keep application metering separate from the simulation host's recording mode.
+With `host-p27` or `host-p30`, use `exact-apply-p27` or `exact-apply-p30`.
 Disable default features for the smaller browser component build.
 
 See the [project documentation](https://github.com/theahaco/soroban-sim) and

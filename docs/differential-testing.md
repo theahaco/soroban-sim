@@ -20,12 +20,20 @@ the oracles, comparison fields, fuzz dimensions, and where each check lives.
   (`differential.test.ts`, `compare.ts`, `decode-ssim.ts`), driven under vitest.
   See "RPC equivalence (M3)" at the end for the actual parity result.
 
+## Protocol and transaction inspection
+
+[Host selection and inspection](host-inspection.md) documents the protocol
+27/29/30 matrix, typed authorization/storage traces, and TTL maintenance.
+The same core suite, including `tests/inspection.rs` and `tests/maintenance.rs`,
+runs on every supported line. The CLI/browser and recorded-network parity
+fixtures retain their protocol-29 default.
+
 ## Purpose
 
 `soroban-sim` runs the same Soroban simulation logic in three places:
 
 1. **native Rust** — `soroban-sim-core` linked against `soroban-simulation`
-   `27.0.1`, driven by `cargo test`;
+   selected by `host-p27`, `host-p29` (default), or `host-p30`, driven by `cargo test`;
 2. **wasmtime** — the `soroban-sim-component` WASM component invoked out of
    process (`scripts/wasmtime-fixture.mjs` / `pnpm run test:wasmtime`);
 3. **browser Worker** — the same component loaded via jco in the web demo,

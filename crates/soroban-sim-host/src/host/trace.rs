@@ -23,6 +23,7 @@ const TRACE_STATE_SHADOW_MEM_LIMIT_FACTOR: u64 = 300;
 pub type TraceHook = Rc<dyn for<'a> Fn(&'a Host, TraceEvent<'a>) -> Result<(), HostError>>;
 
 pub enum TraceEvent<'a> {
+    Inspection(&'a crate::inspection::Event),
     Begin,
     #[allow(private_interfaces)]
     PushCtx(&'a Context),

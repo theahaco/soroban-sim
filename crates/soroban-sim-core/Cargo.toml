@@ -14,16 +14,30 @@ anyhow.workspace = true
 ed25519-dalek.workspace = true
 p256.workspace = true
 sha2.workspace = true
-soroban-env-host = { workspace = true, features = ["recording_mode"] }
+soroban-env-host = { workspace = true, features = ["recording_mode"], optional = true }
 soroban-env-host-apply = { workspace = true, optional = true }
-soroban-simulation.workspace = true
+soroban-simulation = { workspace = true, optional = true }
 stellar-strkey.workspace = true
 
+soroban-env-host-p27 = { package = "soroban-env-host", version = "=27.0.1", features = ["recording_mode"], optional = true }
+soroban-env-host-p30 = { package = "soroban-env-host", version = "=30.0.0", features = ["recording_mode"], optional = true }
+soroban-simulation-p27 = { package = "soroban-simulation", version = "=27.0.1", optional = true }
+soroban-simulation-p30 = { package = "soroban-simulation", version = "=30.0.0", optional = true }
+soroban-env-host-apply-p27 = { package = "soroban-sim-host-p27", path = "../soroban-sim-host-p27", version = "=27.0.1", optional = true }
+soroban-env-host-apply-p30 = { package = "soroban-sim-host-p30", path = "../soroban-sim-host-p30", version = "=30.0.0", optional = true }
+
 [features]
-default = ["exact-apply"]
+default = ["exact-apply", "host-p29"]
 # Apply session transactions with a host built without `recording_mode`, so
 # CPU metering matches stellar-core exactly (see the workspace manifest).
+# Each line has its own isolated host: pair exact-apply with host-p29,
+# exact-apply-p27 with host-p27 and exact-apply-p30 with host-p30.
 exact-apply = ["dep:soroban-env-host-apply"]
+exact-apply-p27 = ["dep:soroban-env-host-apply-p27"]
+exact-apply-p30 = ["dep:soroban-env-host-apply-p30"]
+host-p27 = ["dep:soroban-env-host-p27", "dep:soroban-simulation-p27"]
+host-p29 = ["dep:soroban-env-host", "dep:soroban-simulation"]
+host-p30 = ["dep:soroban-env-host-p30", "dep:soroban-simulation-p30"]
 
 [dev-dependencies]
 base64 = "0.22"

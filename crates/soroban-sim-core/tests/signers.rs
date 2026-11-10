@@ -5,7 +5,7 @@
 mod common;
 
 use common::*;
-use soroban_env_host::xdr::{Int128Parts, ScAddress, ScBytes, ScSymbol, ScVal, ScVec, SorobanCredentials};
+use soroban_sim_core::host::xdr::{Int128Parts, ScAddress, ScBytes, ScSymbol, ScVal, ScVec, SorobanCredentials};
 use soroban_sim_core::session::*;
 use std::collections::BTreeMap;
 
@@ -70,8 +70,8 @@ impl Fixture {
             auth_signers: &auth,
             envelope_signers: std::slice::from_ref(&self.key),
             auth_expiration_ledgers: expiration,
-            memo: soroban_env_host::xdr::Memo::None,
-            preconditions: soroban_env_host::xdr::Preconditions::None,
+            memo: soroban_sim_core::host::xdr::Memo::None,
+            preconditions: soroban_sim_core::host::xdr::Preconditions::None,
         })
     }
 
@@ -133,12 +133,12 @@ fn oz_external_with_the_wrong_key_is_refused() {
     let ScVal::Map(Some(signers)) = &mut entries[1].val else { panic!() };
     let mut s = signers.0.to_vec();
     s[0].val = bytes(&[0u8; 64]);
-    *signers = soroban_env_host::xdr::ScMap(s.try_into().unwrap());
-    *payload = soroban_env_host::xdr::ScMap(entries.try_into().unwrap());
+    *signers = soroban_sim_core::host::xdr::ScMap(s.try_into().unwrap());
+    *payload = soroban_sim_core::host::xdr::ScMap(entries.try_into().unwrap());
     let key = f.key.clone();
     let env = resign(&p.envelope, std::slice::from_ref(&key), |tx| {
         let mut ops = tx.operations.to_vec();
-        let soroban_env_host::xdr::OperationBody::InvokeHostFunction(op) = &mut ops[0].body else { panic!() };
+        let soroban_sim_core::host::xdr::OperationBody::InvokeHostFunction(op) = &mut ops[0].body else { panic!() };
         op.auth = vec![entry].try_into().unwrap();
         tx.operations = ops.try_into().unwrap();
     });

@@ -19,6 +19,8 @@
 //! as a given lane base fee, no classic operations).
 
 mod applier;
+mod inspection;
+pub use inspection::*;
 pub mod replay;
 mod ledger;
 mod signers;
@@ -32,7 +34,7 @@ pub use ledger::{
 };
 pub use signers::{
     auth_payload, base64url, oz_digest, sign_auth_entry, webauthn_sig_data, AuthSigner,
-    Ed25519Key, ExternalKey, OzDigest, OzSigner, Secp256r1Key, WebAuthnAssertion,
+    CustomSigner, DelegateSigner, Ed25519Key, ExternalKey, OzDigest, OzSigner, Secp256r1Key, WebAuthnAssertion,
     ADDR_OZ_V1_DOMAIN, WEBAUTHN_RP_ID,
 };
 pub use validator::{
@@ -140,9 +142,45 @@ impl TxStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SorobanOperation { InvokeHostFunction, ExtendFootprintTtl, RestoreFootprint }
+impl SorobanOperation {
+    fn from_envelope(envelope: &TransactionEnvelope) -> Self {
+        let operations = match envelope {
+            TransactionEnvelope::Tx(e) => &e.tx.operations,
+            TransactionEnvelope::TxV0(e) => &e.tx.operations,
+            TransactionEnvelope::TxFeeBump(e) => { let FeeBumpTransactionInnerTx::Tx(inner) = &e.tx.inner_tx; &inner.tx.operations },
+        };
+        match operations.first().map(|o| &o.body) {
+            Some(OperationBody::ExtendFootprintTtl(_)) => Self::ExtendFootprintTtl,
+            Some(OperationBody::RestoreFootprint(_)) => Self::RestoreFootprint,
+            _ => Self::InvokeHostFunction,
+        }
+    }
+    fn result(self, result: InvokeHostFunctionResult) -> OperationResult {
+        use soroban_env_host::xdr::{ExtendFootprintTtlResult as Extend, RestoreFootprintResult as Restore};
+        OperationResult::OpInner(match self {
+            Self::InvokeHostFunction => OperationResultTr::InvokeHostFunction(result),
+            Self::ExtendFootprintTtl => OperationResultTr::ExtendFootprintTtl(match result {
+                InvokeHostFunctionResult::Success(_) => Extend::Success,
+                InvokeHostFunctionResult::InsufficientRefundableFee => Extend::InsufficientRefundableFee,
+                InvokeHostFunctionResult::ResourceLimitExceeded => Extend::ResourceLimitExceeded,
+                _ => Extend::Malformed,
+            }),
+            Self::RestoreFootprint => OperationResultTr::RestoreFootprint(match result {
+                InvokeHostFunctionResult::Success(_) => Restore::Success,
+                InvokeHostFunctionResult::InsufficientRefundableFee => Restore::InsufficientRefundableFee,
+                InvokeHostFunctionResult::ResourceLimitExceeded => Restore::ResourceLimitExceeded,
+                _ => Restore::Malformed,
+            }),
+        })
+    }
+}
+
 /// One submitted transaction, for the report.
 #[derive(Clone, Debug)]
 pub struct TxRecord {
+    pub operation: SorobanOperation,
     pub label: String,
     /// The ledger it applied in (or would have, if rejected).
     pub ledger: u32,
@@ -170,6 +208,7 @@ pub struct TxRecord {
     pub restored: u32,
     pub events: Vec<ContractEvent>,
     pub diagnostics: Vec<DiagnosticEvent>,
+    pub trace: Option<TransactionTrace>,
     /// What core would report in its `core_metrics` diagnostic events.
     pub metrics: Metrics,
     /// The operation's success result: `sha256(return value, events)`.
@@ -188,7 +227,7 @@ impl TxRecord {
     /// The `TransactionResult` core would record for this submission. A
     /// rejected envelope gets its result code with nothing charged.
     pub fn transaction_result(&self) -> TransactionResult {
-        let op = |r: InvokeHostFunctionResult| OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r));
+        let op = |r: InvokeHostFunctionResult| self.operation.result(r);
         let (success, ops) = match &self.status {
             TxStatus::Applied { .. } => (true, vec![op(InvokeHostFunctionResult::Success(Hash(self.success_hash.unwrap_or_default())))]),
             TxStatus::Failed { code, .. } => (
@@ -196,9 +235,9 @@ impl TxRecord {
                 vec![op(match code {
                     OpFailure::Malformed => InvokeHostFunctionResult::Malformed,
                     OpFailure::Trapped => InvokeHostFunctionResult::Trapped,
-                    OpFailure::ResourceLimitExceeded => InvokeHostFunctionResult::ResourceLimitExceeded,
+                    OpFailure::ResourceLimitExceeded | OpFailure::ExtendResourceLimitExceeded | OpFailure::RestoreResourceLimitExceeded => InvokeHostFunctionResult::ResourceLimitExceeded,
                     OpFailure::EntryArchived => InvokeHostFunctionResult::EntryArchived,
-                    OpFailure::InsufficientRefundableFee => InvokeHostFunctionResult::InsufficientRefundableFee,
+                    OpFailure::InsufficientRefundableFee | OpFailure::ExtendInsufficientRefundableFee | OpFailure::RestoreInsufficientRefundableFee => InvokeHostFunctionResult::InsufficientRefundableFee,
                 })],
             ),
             TxStatus::Rejected { code, fee_bump_inner, .. } => {
@@ -209,6 +248,15 @@ impl TxRecord {
                     }),
                     _ => rejected!(TransactionResultResult, *code),
                 };
+                let mut result = result;
+                if *code == TxCode::OpMalformed {
+                    let replacement = vec![op(InvokeHostFunctionResult::Malformed)].try_into().unwrap_or_default();
+                    match &mut result {
+                        TransactionResultResult::TxFailed(ops) => *ops = replacement,
+                        TransactionResultResult::TxFeeBumpInnerFailed(pair) => pair.result.result = InnerTransactionResultResult::TxFailed(replacement),
+                        _ => {},
+                    }
+                }
                 return TransactionResult { fee_charged: 0, result, ext: TransactionResultExt::V0 };
             }
         };
@@ -272,6 +320,14 @@ impl AuthSignerSource for BTreeMap<ScAddress, AuthSigner> {
     }
 }
 
+/// Authorization recording and credential selection for [`Session::prepare_with`].
+#[derive(Clone, Debug, Default)]
+pub struct PrepareOptions {
+    /// None preserves the signer's choice. Delegated signers populate their delegate signatures.
+    pub credential_kind: Option<CredentialKind>,
+    pub allow_non_root_auth: bool,
+}
+
 /// What `prepare` needs besides the host function.
 pub struct PrepareRequest<'a> {
     pub source: AccountId,
@@ -301,6 +357,8 @@ pub struct SubmitOptions {
     /// deterministic session seed instead, so contracts that use the PRNG see
     /// other values than on chain.
     pub prng_seed: Option<[u8; 32]>,
+    /// Capture typed auth inputs, refusals and per-frame storage accesses. Requires the selected line's exact-apply feature.
+    pub trace: bool,
 }
 
 /// Everything [`Session::restore`] needs to undo what happened since.
@@ -535,14 +593,18 @@ impl Session {
     /// metered into the declared resources), then sign the envelope with the
     /// next sequence number and an inclusion fee of the base fee.
     pub fn prepare(&self, request: &PrepareRequest<'_>) -> Result<Prepared> {
-        // Non-root auth disabled, plain `Address` credentials: what RPC records.
-        let recorded = self.simulate(&request.source, &request.host_function, RecordingInvocationAuthMode::recording(true, false))?;
+        self.prepare_with(request, &PrepareOptions::default())
+    }
+
+    pub fn prepare_with(&self, request: &PrepareRequest<'_>, options: &PrepareOptions) -> Result<Prepared> {
+        let address_bound = matches!(options.credential_kind, Some(CredentialKind::AddressV2 | CredentialKind::AddressWithDelegates));
+        let recorded = self.simulate(&request.source, &request.host_function, RecordingInvocationAuthMode::recording(!options.allow_non_root_auth, address_bound))?;
         let recorded_value = match &recorded.invoke_result {
             Ok(v) => v.clone(),
             Err(e) => bail!("simulation failed: {:?}{}", e.error, diagnostics_tail(&recorded.diagnostic_events)),
         };
         let recorded_data = recorded.transaction_data.clone().ok_or_else(|| anyhow!("simulation returned no transaction data"))?;
-        let expiration = self.info.sequence_number + request.auth_expiration_ledgers.unwrap_or(self.options.auth_expiration_ledgers);
+        let expiration = self.info.sequence_number.checked_add(request.auth_expiration_ledgers.unwrap_or(self.options.auth_expiration_ledgers)).ok_or_else(|| anyhow!("authorization expiration overflows the ledger number"))?;
         let mut auth = recorded.auth.clone();
         for entry in &mut auth {
             let address = match &entry.credentials {
@@ -554,6 +616,17 @@ impl Session {
                 .signer_for(self, &address)?
                 .ok_or_else(|| anyhow!("{address} must authorize this call, but no signer is registered for it"))?;
             sign_auth_entry(entry, &signer, self.info.network_id, expiration).with_context(|| format!("signing for {address}"))?;
+            if let Some(kind) = options.credential_kind {
+                match (&entry.credentials, kind) {
+                    (SorobanCredentials::Address(_), CredentialKind::Address) |
+                    (SorobanCredentials::AddressV2(_), CredentialKind::AddressV2) |
+                    (SorobanCredentials::AddressWithDelegates(_), CredentialKind::AddressWithDelegates) => {},
+                    (SorobanCredentials::AddressV2(c), CredentialKind::AddressWithDelegates) => {
+                        entry.credentials = SorobanCredentials::AddressWithDelegates(soroban_env_host::xdr::SorobanAddressCredentialsWithDelegates { address_credentials: c.clone(), delegates: Default::default() });
+                    }
+                    _ => bail!("signer for {address} produced credentials incompatible with {kind:?}"),
+                }
+            }
         }
         let enforced = self.simulate(&request.source, &request.host_function, RecordingInvocationAuthMode::Enforcing(auth.clone()))?;
         let value = enforced
@@ -592,6 +665,37 @@ impl Session {
         })
     }
 
+    /// Simulate and sign a standalone restore or TTL extension. Archived values
+    /// must be available from the fork's LedgerSource (or its local overlay).
+    pub fn prepare_maintenance(&self, source: &AccountId, operation: OperationBody, keys: &[soroban_env_host::xdr::LedgerKey], signers: &[Ed25519Key]) -> Result<Prepared> {
+        use soroban_simulation::simulation::{simulate_extend_ttl_op, simulate_restore_op};
+        let view = ForkView(self.ledger.clone());
+        let adjustment = SimulationAdjustmentConfig::default_adjustment();
+        let data = match &operation {
+            OperationBody::ExtendFootprintTtl(op) => {
+                if op.extend_to >= self.info.max_entry_ttl || self.info.sequence_number.checked_add(op.extend_to).is_none() { bail!("TTL extension exceeds the maximum entry TTL"); }
+                simulate_extend_ttl_op(&view, &self.network_config, &adjustment, &self.info, keys, op.extend_to)?.transaction_data
+            },
+            OperationBody::RestoreFootprint(_) => simulate_restore_op(&view, &self.network_config, &adjustment, &self.info, keys)?.transaction_data,
+            _ => bail!("prepare_maintenance requires ExtendFootprintTtl or RestoreFootprint"),
+        };
+        let account = self.ledger.account(source)?.ok_or_else(|| anyhow!("source account is absent"))?;
+        let PublicKey::PublicKeyTypeEd25519(source_key) = &source.0;
+        let tx = Transaction {
+            source_account: MuxedAccount::Ed25519(source_key.clone()),
+            fee: (data.resource_fee + i64::from(self.fork.base_fee)).try_into()?,
+            seq_num: SequenceNumber(account.seq_num.0.checked_add(1).ok_or_else(|| anyhow!("sequence overflow"))?),
+            cond: Preconditions::None, memo: Memo::None,
+            operations: vec![Operation { source_account: None, body: operation }].try_into()?,
+            ext: TransactionExt::V1(data.clone()),
+        };
+        let hash = transaction_hash(&tx, self.info.network_id)?;
+        let signatures: Vec<_> = signers.iter().map(|s| s.sign_decorated(&hash)).collect();
+        Ok(Prepared { envelope: TransactionEnvelope::Tx(TransactionV1Envelope { tx, signatures: signatures.try_into()? }), hash,
+            value: ScVal::Void, transaction_data: data.clone(), auth: vec![],
+            recorded: Recorded { value: ScVal::Void, transaction_data: data, auth: vec![] } })
+    }
+
     /// Validate and apply one envelope. A valid envelope closes the ledger it
     /// applied in, success or failure; a rejected one never reaches a ledger.
     pub fn submit(&mut self, label: &str, envelope: &TransactionEnvelope) -> Result<TxRecord> {
@@ -600,6 +704,7 @@ impl Session {
 
     /// [`Session::submit`] with what the ledger close decides set explicitly.
     pub fn submit_with(&mut self, label: &str, envelope: &TransactionEnvelope, options: &SubmitOptions) -> Result<TxRecord> {
+        if options.trace && !EXACT_APPLY { bail!("transaction inspection requires an exact-apply feature (exact-apply, exact-apply-p27 or exact-apply-p30)"); }
         let validator = TxValidator {
             ledger: &self.ledger,
             info: &self.info,
@@ -609,6 +714,7 @@ impl Session {
             lane_base_fee: options.lane_base_fee,
         };
         let mut record = TxRecord {
+            operation: SorobanOperation::from_envelope(envelope),
             label: label.to_string(),
             ledger: self.info.sequence_number,
             close_time: self.info.timestamp,
@@ -637,6 +743,7 @@ impl Session {
             restored: 0,
             events: vec![],
             diagnostics: vec![],
+            trace: None,
             metrics: Metrics::default(),
             success_hash: None,
             signers: vec![],
@@ -652,7 +759,7 @@ impl Session {
         };
         let applied = self
             .applier
-            .apply(&self.ledger, &self.info, &self.network_config, &self.limits, &valid, self.options.enable_diagnostics, options.prng_seed)
+            .apply_with_trace(&self.ledger, &self.info, &self.network_config, &self.limits, &valid, self.options.enable_diagnostics, options.prng_seed, options.trace)
             .map_err(|e| with_fetch_error(e, &self.ledger))?;
         record.fees = valid.fees;
         record.fee_charged = applied.fee_charged;
@@ -668,6 +775,7 @@ impl Session {
         record.restored = applied.restored;
         record.events = applied.events;
         record.diagnostics = applied.diagnostics;
+        record.trace = applied.trace;
         record.metrics = applied.metrics;
         record.success_hash = applied.success_hash;
         record.signers = valid.signers;

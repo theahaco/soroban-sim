@@ -1286,6 +1286,27 @@ impl AuthorizationManager {
         }
         // No matching tracker found, hence the invocation isn't
         // authorized.
+        host.observe(|| {
+            let requested = function.to_xdr(host)?;
+            let mut kind = "NodeMissing";
+            for tracker in self.try_borrow_account_trackers(host)?.iter() {
+                if let Ok(mut tracker) = tracker.try_borrow_mut() {
+                    if !host.compare(&tracker.address, &address)?.is_eq() { continue; }
+                    let inv = &mut tracker.invocation_tracker;
+                    let candidates = if let Some(parent) = inv.last_authorized_invocation_mut()? {
+                        parent.sub_invocations.iter().filter(|n| !n.is_exhausted).map(|n| &n.function).collect::<Vec<_>>()
+                    } else if !has_active_tracker && !inv.root_authorized_invocation.is_exhausted {
+                        vec![&inv.root_authorized_invocation.function]
+                    } else { vec![] };
+                    for candidate in candidates {
+                        if let (SorobanAuthorizedFunction::ContractFn(a), SorobanAuthorizedFunction::ContractFn(b)) = (candidate.to_xdr(host)?, &requested) {
+                            if a.contract_address == b.contract_address && a.function_name == b.function_name && a.args != b.args { kind = "ArgsMismatch"; }
+                        }
+                    }
+                }
+            }
+            Ok(crate::inspection::Event::AuthFailure { address: host.scaddress_from_address(address)?, kind, error: None, function: Some(requested) })
+        });
         Err(host.err(
             ScErrorType::Auth,
             ScErrorCode::InvalidAction,
@@ -2590,6 +2611,7 @@ impl AccountAuthorizationTracker {
         if let Some((nonce, live_until_ledger)) = &self.nonce {
             let ledger_seq = host.with_ledger_info(|li| Ok(li.sequence_number))?;
             if ledger_seq > *live_until_ledger {
+                host.observe_auth_failure(self.address, "SignatureExpired");
                 return Err(host.err(
                     ScErrorType::Auth,
                     ScErrorCode::InvalidInput,
@@ -2603,6 +2625,7 @@ impl AccountAuthorizationTracker {
             }
             let max_live_until_ledger = host.max_live_until_ledger()?;
             if *live_until_ledger > max_live_until_ledger {
+                host.observe_auth_failure(self.address, "SignatureExpirationTooLate");
                 return Err(host.err(
                     ScErrorType::Auth,
                     ScErrorCode::InvalidInput,
@@ -2984,6 +3007,7 @@ impl Host {
                 }
                 err
             })? {
+                self.observe_auth_failure(address, "NonceReused");
                 return Err(self.err(
                     ScErrorType::Auth,
                     ScErrorCode::ExistingValue,

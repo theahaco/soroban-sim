@@ -8,13 +8,13 @@
 //! (d) nested caller fixture -> >=2 PushCtx (cross-contract frame visible);
 //! (e) storage get_persist -> an EnvCall naming the storage host fn.
 
-use soroban_env_host::xdr::{ContractDataDurability, Limits, ReadXdr, ScVal};
+use soroban_sim_core::host::xdr::{ContractDataDurability, Limits, ReadXdr, ScVal};
 use soroban_sim_core::*;
 
 /// A live-until comfortably in the future (> fixture sequence 1_000_000).
 const LIVE: u32 = 1_500_000;
 
-fn p(entry: soroban_env_host::xdr::LedgerEntry, ttl: u32) -> LedgerEntryWithLiveUntil {
+fn p(entry: soroban_sim_core::host::xdr::LedgerEntry, ttl: u32) -> LedgerEntryWithLiveUntil {
     LedgerEntryWithLiveUntil {
         entry,
         live_until_ledger: Some(ttl),

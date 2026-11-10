@@ -23,7 +23,7 @@
 //! Plus TTL boundaries (fuzz dimension): live_until at / just-above / just-below the
 //! ledger sequence, and the `Some(live_until)` requirement.
 
-use soroban_env_host::xdr::{HostFunction, LedgerEntry, LedgerKey, Limits, ScVal, WriteXdr};
+use soroban_sim_core::host::xdr::{HostFunction, LedgerEntry, LedgerKey, Limits, ScVal, WriteXdr};
 use soroban_sim_core::*;
 
 /// `fixture_ledger_info().sequence_number`.
@@ -295,17 +295,17 @@ fn claim2_disjoint_absent_keys_do_not_perturb_present_result() {
         contract_data_key(
             STORAGE_CONTRACT_ID,
             ScVal::U32(1),
-            soroban_env_host::xdr::ContractDataDurability::Persistent,
+            soroban_sim_core::host::xdr::ContractDataDurability::Persistent,
         ),
         contract_data_key(
             STORAGE_CONTRACT_ID,
             ScVal::U32(2),
-            soroban_env_host::xdr::ContractDataDurability::Temporary,
+            soroban_sim_core::host::xdr::ContractDataDurability::Temporary,
         ),
         contract_data_key(
             [99; 32],
             ScVal::Symbol("nope".try_into().unwrap()),
-            soroban_env_host::xdr::ContractDataDurability::Persistent,
+            soroban_sim_core::host::xdr::ContractDataDurability::Persistent,
         ),
         // Bogus ContractCode hash: sha256 of bytes that are not any fixture wasm.
         contract_code_key(b"not-a-real-contract-wasm-blob"),

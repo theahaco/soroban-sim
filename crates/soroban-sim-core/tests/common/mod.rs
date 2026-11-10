@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 use base64::Engine;
-use soroban_env_host::xdr::{
+use soroban_sim_core::host::xdr::{
     AccountEntry, AccountId, Asset, ContractExecutable, ContractIdPreimage,
     ContractIdPreimageFromAddress, CreateContractArgs, CreateContractArgsV2, Hash, HashIdPreimage,
     HashIdPreimageContractId, HostFunction, InvokeContractArgs, LedgerEntry, LedgerEntryData,
@@ -213,7 +213,7 @@ pub fn expect_failed(r: &TxRecord, needle: &str) -> String {
 pub fn deploy(s: &mut Session, deployer: &AccountId, key: &Ed25519Key, name: &str, salt: &str, args: Vec<ScVal>) -> ScAddress {
     let code = wasm(name);
     let hash = sha256(&code);
-    if s.ledger().get(&soroban_env_host::xdr::LedgerKey::ContractCode(soroban_env_host::xdr::LedgerKeyContractCode { hash: Hash(hash) })).unwrap().is_none() {
+    if s.ledger().get(&soroban_sim_core::host::xdr::LedgerKey::ContractCode(soroban_sim_core::host::xdr::LedgerKeyContractCode { hash: Hash(hash) })).unwrap().is_none() {
         apply(s, &format!("upload {name}"), deployer, std::slice::from_ref(key), upload(&code));
     }
     let value = apply(s, &format!("deploy {name}"), deployer, std::slice::from_ref(key), create(deployer, sha256(salt.as_bytes()), hash, args));

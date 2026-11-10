@@ -11,7 +11,7 @@ readme = "README.md"
 autobins = false
 autotests = false
 autobenches = false
-include = ["src/**", "build.rs", "README.md", "UPSTREAM-README.md", "UPSTREAM.json", "LICENSE"]
+include = ["src/**", "build.rs", "README.md", "UPSTREAM-README.md", "UPSTREAM.json", "PATCHES.json", "LICENSE"]
 
 # This compatibility package is validated by soroban-sim's replay tests.
 # Upstream's test-only targets/dependencies are not part of its public package.

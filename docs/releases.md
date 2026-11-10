@@ -96,8 +96,9 @@ mainnet/testnet replay sample; it remains below crates.io's package size limit.
 ## Maintaining the isolated host
 
 `soroban-sim-host` has a different Cargo identity from `soroban-env-host`, while
-its `src/` and `build.rs` are copied byte-for-byte from the upstream release
-recorded in `UPSTREAM.json` (currently 29.0.2). This
+`UPSTREAM.json` records its upstream source (29.0.2) and `PATCHES.json`
+records the inspection additions. Protocol 27 and 30 have separate isolated
+host packages with the same provenance contract. This
 keeps the simulator's `recording_mode` feature out of exact transaction
 application. A second dependency alias for the same upstream registry package
 would unify the features and change write metering. Disabling default features
@@ -105,7 +106,7 @@ on the component deliberately keeps its existing smaller host build.
 
 `crates/soroban-sim-host/UPSTREAM.json` records the registry archive SHA-256,
 upstream commit and copied file checksums. `check-upstream-host.py` checks the
-copy's provenance contract. The existing CLI replay tests independently verify
+copy's provenance contract. The protocol-matrix tests compare traced and untraced execution. The existing CLI replay tests independently verify
 transaction results, fees, state changes and CPU/memory metrics. Do not replace
 those behavior checks with the checksum check, and do not run formatting or
 mechanical fixes across the vendored source.
@@ -117,7 +118,8 @@ To upgrade:
 2. Replace the compatibility package's `src/`, `build.rs` and upstream README
    from that archive. Retain upstream licensing/attribution. Update the
    provenance manifest's version, commit, archive hash and complete file map.
-3. Reconcile the normalized upstream production dependencies/features into the
+3. Reapply and review the inspection patches, then update `PATCHES.json` as
+   described in [host inspection](host-inspection.md). Reconcile the normalized upstream production dependencies/features into the
    compatibility manifest; all dependencies must remain registry-resolvable.
    Upstream test/bench targets are not this package's validation suite.
 4. Set the package version to a new version and update core's exact pin on it

@@ -5,7 +5,7 @@
 mod common;
 
 use common::*;
-use soroban_env_host::xdr::{
+use soroban_sim_core::host::xdr::{
     Duration, Int128Parts, LedgerBounds, LedgerKey, LedgerKeyContractCode, Preconditions,
     PreconditionsV2, ScAddress, ScVal, SorobanCredentials, TimeBounds, TimePoint, TransactionExt,
 };
@@ -46,7 +46,7 @@ fn state_carries_across_upload_deploy_invoke() {
     }
 
     // The code is in the module cache once a transaction used it.
-    assert!(s.applier().cached_modules().contains(&soroban_env_host::xdr::Hash(sha256(&wasm("add_i32")))));
+    assert!(s.applier().cached_modules().contains(&soroban_sim_core::host::xdr::Hash(sha256(&wasm("add_i32")))));
 
     // The final diff: alice's account, the code, the instance. One override.
     let diff = s.ledger().diff();
@@ -117,7 +117,7 @@ fn auth_entry_signed_by_the_wrong_key_fails_in_the_host() {
             auth_signers: &wrong,
             envelope_signers: std::slice::from_ref(&carol),
             auth_expiration_ledgers: None,
-            memo: soroban_env_host::xdr::Memo::None,
+            memo: soroban_sim_core::host::xdr::Memo::None,
             preconditions: Preconditions::None,
         })
         .unwrap_err();
@@ -132,7 +132,7 @@ fn auth_entry_signed_by_the_wrong_key_fails_in_the_host() {
     sign_auth_entry(&mut forged[0], &wrong[&ScAddress::Account(alice())], s.network_id(), expiration).unwrap();
     let env = resign(&p.envelope, std::slice::from_ref(&carol), |tx| {
         let mut ops = tx.operations.to_vec();
-        let soroban_env_host::xdr::OperationBody::InvokeHostFunction(op) = &mut ops[0].body else { panic!() };
+        let soroban_sim_core::host::xdr::OperationBody::InvokeHostFunction(op) = &mut ops[0].body else { panic!() };
         op.auth = forged.try_into().unwrap();
         tx.operations = ops.try_into().unwrap();
     });
@@ -183,7 +183,7 @@ fn an_expired_auth_signature_fails_at_apply_and_still_pays() {
             auth_signers: &signers,
             envelope_signers: std::slice::from_ref(&carol),
             auth_expiration_ledgers: Some(5),
-            memo: soroban_env_host::xdr::Memo::None,
+            memo: soroban_sim_core::host::xdr::Memo::None,
             preconditions: Preconditions::None,
         })
         .unwrap();
@@ -208,7 +208,7 @@ fn archived_entries_must_be_restored() {
 
     // Past every TTL: the instance, the code and the entry are archived.
     s.advance(s.ledger_info().min_persistent_entry_ttl + 10, None);
-    let code_key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: soroban_env_host::xdr::Hash(sha256(&wasm("storage"))) });
+    let code_key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: soroban_sim_core::host::xdr::Hash(sha256(&wasm("storage"))) });
     let code = s.ledger().get(&code_key).unwrap();
     assert_eq!(EntryState::of(code.as_ref(), s.ledger_info().sequence_number), EntryState::Archived);
 
@@ -304,7 +304,7 @@ fn min_seq_num_leaves_the_account_at_the_transaction_sequence() {
         tx.cond = Preconditions::V2(PreconditionsV2 {
             time_bounds: None,
             ledger_bounds: None,
-            min_seq_num: Some(soroban_env_host::xdr::SequenceNumber(at)),
+            min_seq_num: Some(soroban_sim_core::host::xdr::SequenceNumber(at)),
             min_seq_age: Duration(0),
             min_seq_ledger_gap: 0,
             extra_signers: Default::default(),
@@ -459,7 +459,7 @@ fn network_limits_load_from_the_ledger() {
 
 #[test]
 fn substitution_keeps_sponsorship_descriptors_aligned_with_signers() {
-    use soroban_env_host::xdr::{
+    use soroban_sim_core::host::xdr::{
         AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountEntryExtensionV2,
         AccountEntryExtensionV2Ext, Liabilities, Signer, SignerKey, SponsorshipDescriptor, Uint256,
     };

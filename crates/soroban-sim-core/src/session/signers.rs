@@ -220,9 +220,37 @@ pub enum OzSigner {
     Delegated { account: AccountId, keys: Vec<Ed25519Key> },
 }
 
+/// A signature adapter for an arbitrary custom account. It receives the exact
+/// host preimage hash (the root account's hash for every delegate).
+type SignCallback = dyn Fn(&[u8; 32]) -> Result<ScVal>;
+#[derive(Clone)]
+pub struct CustomSigner(std::rc::Rc<SignCallback>);
+impl CustomSigner {
+    pub fn new(sign: impl Fn(&[u8; 32]) -> Result<ScVal> + 'static) -> Self { Self(std::rc::Rc::new(sign)) }
+}
+impl std::fmt::Debug for CustomSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("CustomSigner(..)") }
+}
+#[derive(Clone, Debug)]
+pub struct DelegateSigner {
+    pub address: ScAddress,
+    pub signer: CustomSigner,
+    pub delegates: Vec<DelegateSigner>,
+}
+fn sign_delegates(nodes: &[DelegateSigner], payload: &[u8; 32]) -> Result<Vec<SorobanDelegateSignature>> {
+    let mut result = nodes.iter().map(|node| Ok(SorobanDelegateSignature {
+        address: node.address.clone(), signature: (node.signer.0)(payload)?,
+        nested_delegates: sign_delegates(&node.delegates, payload)?.try_into()?,
+    })).collect::<Result<Vec<_>>>()?;
+    result.sort_by(|a, b| a.address.cmp(&b.address));
+    if result.windows(2).any(|w| w[0].address == w[1].address) { bail!("duplicate delegate address"); }
+    Ok(result)
+}
+
 /// How the authorization entry for one address gets signed.
 #[derive(Clone, Debug)]
 pub enum AuthSigner {
+    Custom { signer: CustomSigner, delegates: Vec<DelegateSigner> },
     Classic { keys: Vec<Ed25519Key>, address_bound: bool },
     OzSmartAccount { rule_ids: Vec<u32>, digest: OzDigest, signers: Vec<OzSigner> },
 }
@@ -283,12 +311,22 @@ pub fn sign_auth_entry(entry: &mut SorobanAuthorizationEntry, signer: &AuthSigne
         SorobanCredentials::AddressWithDelegates(_) => bail!("entry is already signed with delegates"),
     };
     creds.signature_expiration_ledger = expiration_ledger;
+    let recorded_v2 = matches!(entry.credentials, SorobanCredentials::AddressV2(_));
     match signer {
+        AuthSigner::Custom { signer, delegates } => {
+            let bound = (recorded_v2 || !delegates.is_empty()).then(|| creds.address.clone());
+            let payload = auth_payload(network_id, &creds, entry, bound.as_ref())?;
+            creds.signature = (signer.0)(&payload)?;
+            entry.credentials = if !delegates.is_empty() {
+                SorobanCredentials::AddressWithDelegates(SorobanAddressCredentialsWithDelegates { address_credentials: creds, delegates: sign_delegates(delegates, &payload)?.try_into()? })
+            } else if recorded_v2 { SorobanCredentials::AddressV2(creds) } else { SorobanCredentials::Address(creds) };
+        }
         AuthSigner::Classic { keys, address_bound } => {
+            let address_bound = *address_bound || recorded_v2;
             let bound = address_bound.then(|| creds.address.clone());
             let payload = auth_payload(network_id, &creds, entry, bound.as_ref())?;
             creds.signature = classic_signature(keys, &payload)?;
-            entry.credentials = if *address_bound { SorobanCredentials::AddressV2(creds) } else { SorobanCredentials::Address(creds) };
+            entry.credentials = if address_bound { SorobanCredentials::AddressV2(creds) } else { SorobanCredentials::Address(creds) };
         }
         AuthSigner::OzSmartAccount { rule_ids, digest, signers } => {
             if signers.is_empty() {
@@ -297,7 +335,7 @@ pub fn sign_auth_entry(entry: &mut SorobanAuthorizationEntry, signer: &AuthSigne
             // An entry with delegates uses the address-bound preimage, both for
             // the account's own `__check_auth` and for every delegate.
             let with_delegates = signers.iter().any(|s| matches!(s, OzSigner::Delegated { .. }));
-            let bound = with_delegates.then(|| creds.address.clone());
+            let bound = (with_delegates || recorded_v2).then(|| creds.address.clone());
             let payload = auth_payload(network_id, &creds, entry, bound.as_ref())?;
             let oz = oz_digest(digest, &creds.address, &payload, rule_ids)?;
             let mut map = vec![];
@@ -324,7 +362,7 @@ pub fn sign_auth_entry(entry: &mut SorobanAuthorizationEntry, signer: &AuthSigne
                 (sym("signers")?, map_val(map)?),
             ])?;
             entry.credentials = if delegates.is_empty() {
-                SorobanCredentials::Address(creds)
+                if recorded_v2 { SorobanCredentials::AddressV2(creds) } else { SorobanCredentials::Address(creds) }
             } else {
                 // The host requires delegates sorted by address, without duplicates.
                 delegates.sort_by(|a, b| a.address.cmp(&b.address));

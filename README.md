@@ -2,6 +2,10 @@
 
 Portable Soroban simulation spike for browsers, WASI Preview 2 components, and native Rust.
 
+Native differential tests can select protocol 27, 29, or 30, inspect exact
+`__check_auth` inputs and per-frame storage rollback, and apply standalone TTL
+extension and restoration transactions. See [host selection and inspection](docs/host-inspection.md).
+
 ## Why rehearse on a fork
 
 Testnet is shared, and its costs can move away from mainnet's. On 2026-10-25,

@@ -5,7 +5,7 @@
 mod common;
 
 use common::*;
-use soroban_env_host::xdr::{
+use soroban_sim_core::host::xdr::{
     FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt, FeeBumpTransactionInnerTx,
     InnerTransactionResultResult, InvokeHostFunctionResult, Memo, MuxedAccount, OperationResult, OperationResultTr, ScAddress, ScVal, StringM,
     TransactionEnvelope, TransactionExt, TransactionResultResult, Uint256,
@@ -13,7 +13,7 @@ use soroban_env_host::xdr::{
 use soroban_sim_core::session::*;
 
 fn i128(n: i64) -> ScVal {
-    ScVal::I128(soroban_env_host::xdr::Int128Parts { hi: if n < 0 { -1 } else { 0 }, lo: n as u64 })
+    ScVal::I128(soroban_sim_core::host::xdr::Int128Parts { hi: if n < 0 { -1 } else { 0 }, lo: n as u64 })
 }
 
 /// `inner` fee-bumped by `payer` with an outer fee of `fee`.
@@ -116,13 +116,13 @@ fn the_lane_base_fee_caps_the_inclusion_fee() {
     // Without surge pricing the ledger's base fee is charged...
     assert_eq!(quiet.submit("base fee", &rich2).unwrap().fees.inclusion, 100);
     // ...under surge pricing the lane's base fee, up to the bid...
-    let r = s.submit_with("surge", &rich, &SubmitOptions { lane_base_fee: Some(3_000), prng_seed: None }).unwrap();
+    let r = s.submit_with("surge", &rich, &SubmitOptions { lane_base_fee: Some(3_000), prng_seed: None, ..Default::default() }).unwrap();
     assert!(r.status.is_applied());
     assert_eq!(r.fees.inclusion, 3_000);
     // ...and a transaction-set component without a base fee charges the whole bid.
     let p = prepare(&s, &alice(), std::slice::from_ref(&key), invoke(&sac_id(), "decimals", vec![]), &no_auth());
     let rich = resign(&p.envelope, std::slice::from_ref(&key), |tx| tx.fee += 9_900);
-    let r = s.submit_with("full bid", &rich, &SubmitOptions { lane_base_fee: Some(i64::MAX), prng_seed: None }).unwrap();
+    let r = s.submit_with("full bid", &rich, &SubmitOptions { lane_base_fee: Some(i64::MAX), prng_seed: None, ..Default::default() }).unwrap();
     assert_eq!(r.fees.inclusion, 10_000);
 }
 

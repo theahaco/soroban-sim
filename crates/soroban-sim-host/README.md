@@ -5,11 +5,16 @@ transaction application path. It provides a distinct Cargo package identity on c
 so the simulation host's `recording_mode` feature is not unified into the host
 that applies transactions. That feature changes CPU metering on writes.
 
-`src/` and `build.rs` are unchanged upstream source. `UPSTREAM.json` records the
+`UPSTREAM.json` records the
 upstream version, commit, published archive checksum and each copied file's
 SHA-256. This package's own version is independent: a packaging-only release
 (for example 29.0.3) can still contain upstream 29.0.2 source, so check
 `UPSTREAM.json` rather than the package version for the upstream release.
+`PATCHES.json` records the small inspection-only changes to that source.
+They add typed, opt-in observations under the shadow budget; they do not
+replace host matching, storage or rollback algorithms. Every other copied file
+must remain byte-identical to upstream. The protocol-matrix tests compare
+traced and untraced transaction results, fees and metering.
 The package manifest and this README are Soroban Sim's packaging changes;
 `UPSTREAM-README.md` preserves the upstream overview. Apache-2.0 licensing and
 Stellar Development Foundation attribution are retained.
