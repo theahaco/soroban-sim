@@ -2261,7 +2261,7 @@ dependencies = [
 
 [[package]]
 name = "soroban-sim-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2284,7 +2284,7 @@ dependencies = [
 
 [[package]]
 name = "soroban-sim-cli-p30"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2306,7 +2306,7 @@ dependencies = [
 
 [[package]]
 name = "soroban-sim-component"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2319,7 +2319,7 @@ dependencies = [
 
 [[package]]
 name = "soroban-sim-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2336,7 +2336,7 @@ dependencies = [
 
 [[package]]
 name = "soroban-sim-core-p30"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2352,7 +2352,7 @@ dependencies = [
 
 [[package]]
 name = "soroban-sim-facade"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2367,7 +2367,7 @@ dependencies = [
 
 [[package]]
 name = "soroban-sim-facade-p30"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2419,7 +2419,7 @@ dependencies = [
 
 [[package]]
 name = "soroban-sim-preview"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "serde_json",
