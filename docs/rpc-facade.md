@@ -250,6 +250,9 @@ curl -s "$URL" -H 'content-type: application/json' \
 soroban-sim serve --snapshot setup.json --port 0        # one per test, in parallel
 ```
 
+[`packages/soroban-sim-vitest`](../packages/soroban-sim-vitest) does this for
+Vitest suites, and caches the setup's export between runs.
+
 ## Safety
 
 The facade keeps the real network passphrase, because that is what makes every

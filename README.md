@@ -299,6 +299,29 @@ pnpm --filter @theahaco/soroban-sign-dialog build
 pnpm --filter @theahaco/soroban-sign-dialog demo   # http://127.0.0.1:4178/demo/
 ```
 
+## Test suites
+
+`packages/soroban-sim-vitest` (`@theahaco/soroban-sim-vitest`) runs Vitest
+suites whose setup runs once on `soroban-sim serve`. The result is exported
+as a snapshot (`fork_exportSnapshot`) and cached on disk, and each test gets
+its own server started from it, so tests are isolated and run in parallel.
+The same suite also runs against a local network (quickstart), where setup
+runs once per test with fresh friendbot-funded accounts. Which one runs is
+the `SOROBAN_TEST_ENV` variable, not the test code. Contracts are the Stellar
+SDK's own contract clients (`contract.Client`, or the class generated
+bindings define) bound to funded accounts: `await (await token.transfer({
+from: alice.address, to: bob.address, amount: 10n })).signAndSend()`, with
+failures thrown as typed errors carrying the contract's error code. On
+soroban-sim, tests can also set balances, patch contract storage and move
+ledger time. See the package README for the API and for what differs between
+the two environments.
+
+```sh
+cargo build --release -p soroban-sim-cli
+pnpm --filter @theahaco/soroban-sim-vitest test         # soroban-sim
+pnpm --filter @theahaco/soroban-sim-vitest test:local   # a running local network
+```
+
 ## Docs
 
 - `docs/architecture.md` — design and state-loading plan.
@@ -310,6 +333,7 @@ pnpm --filter @theahaco/soroban-sign-dialog demo   # http://127.0.0.1:4178/demo/
 - `docs/differential-testing.md` — oracles A/B/C and the M3 RPC-equivalence result.
 - `docs/upstream.md` — upstream pins and contribution notes.
 - `packages/soroban-sign-dialog/README.md` — the sign dialog: embedding, frameworks, theming, the preview engine.
+- `packages/soroban-sim-vitest/README.md` — Vitest suites on soroban-sim or a local network: workers, accounts and SDK contract clients, setup, sandbox controls, the cache, what differs.
 - `CONTRIBUTING.md` — PR and commit templates, and the checks that run on every PR.
 
 ## License

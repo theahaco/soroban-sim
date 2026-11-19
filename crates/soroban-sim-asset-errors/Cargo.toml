@@ -1,0 +1,15 @@
+[package]
+name = "soroban-sim-asset-errors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Emits the Stellar asset contract's error table and bindings for @theahaco/soroban-sim-vitest"
+
+[dependencies]
+# What the host's contract_error.rs, compiled here as a module, itself uses.
+num-derive = "0.4.1"
+num-traits = "0.2.17"
+soroban-env-common = { version = "=29.0.2", default-features = false, features = ["std"] }

@@ -27,7 +27,8 @@ Add `!` before the colon for a breaking change.
   - crates: `cli`, `core`, `facade`, `component`, `host` (the vendored
     `soroban-sim-host`), `preview`, `twins` (the `-p30` crates);
   - CLI areas: `session`, `replay`, `serve`, `snapshot`, `differential`;
-  - packages: `soroban-sign-dialog`, `web-demo`, `js` (`@theahaco/soroban-sim`);
+  - packages: `soroban-sign-dialog`, `soroban-sim-vitest`, `web-demo`, `js`
+    (`@theahaco/soroban-sim`);
   - the rest: `fixtures`, `release`, `pr-preview`, `readme`, `deps`.
 
 The scope list lives in [`.github/review-conventions.json`](./.github/review-conventions.json).

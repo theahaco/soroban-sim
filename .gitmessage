@@ -3,8 +3,9 @@
 # type(scope)!: imperative summary, lower-case, no full stop (<= 72 chars)
 #   types:  feat fix perf refactor revert test docs build ci chore style
 #   scopes: cli core facade component host preview twins session replay
-#           serve snapshot differential soroban-sign-dialog web-demo js
-#           fixtures release pr-preview readme deps
+#           serve snapshot differential soroban-sign-dialog
+#           soroban-sim-vitest web-demo js fixtures release pr-preview
+#           readme deps
 #   (.github/review-conventions.json holds the list; a scope is optional)
 #
 # The same structure as the PR description, in miniature. Wrap at 72.

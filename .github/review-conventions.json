@@ -15,6 +15,7 @@
       "snapshot",
       "differential",
       "soroban-sign-dialog",
+      "soroban-sim-vitest",
       "web-demo",
       "js",
       "fixtures",

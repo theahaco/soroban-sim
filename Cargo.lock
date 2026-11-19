@@ -2260,6 +2260,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "soroban-sim-asset-errors"
+version = "0.1.0"
+dependencies = [
+ "num-derive",
+ "num-traits",
+ "soroban-env-common 29.0.2",
+]
+
+[[package]]
 name = "soroban-sim-cli"
 version = "0.1.0"
 dependencies = [

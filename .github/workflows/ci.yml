@@ -101,6 +101,180 @@ jobs:
       - name: Demo and framework browser tests
         run: pnpm --filter @theahaco/soroban-sign-dialog test:browser
 
+  # The Vitest harness (packages/soroban-sim-vitest) runs the same suites on
+  # soroban-sim and on a quickstart local network, in two independent jobs
+  # that each pay only for what their environment needs. Each writes its
+  # setup and test times, total and peak memory to the run summary, so the
+  # two can be compared on every run (packages/soroban-sim-vitest/ci).
+
+  # The harness's type check is a job of its own, so neither cost job's total
+  # includes it.
+  vitest-types:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.11.0
+          run_install: false
+      - run: pnpm install --frozen-lockfile
+      - name: Type check
+        run: pnpm --filter @theahaco/soroban-sim-vitest check
+
+  # The harness's table of the asset contract's errors is emitted from the
+  # host's own enum, and its bindings for that contract are stellar-cli's,
+  # rewritten for plain Node (crates/soroban-sim-asset-errors); this fails
+  # when the committed table differs from what the emitter writes, or the
+  # committed bindings lack that rewrite. The bindings' interface is not
+  # generated again here.
+  vitest-generated:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: vitest-generated
+      - name: The asset contract's error table is up to date and its bindings carry the plain-Node rewrite
+        run: cargo run -p soroban-sim-asset-errors --locked -- --check
+
+  # The latest release (soroban-sim-cli-v0.1.0) predates fork_exportSnapshot,
+  # which the harness needs, so the CLI is built once from this commit and
+  # handed to vitest-soroban-sim as an artifact.
+  vitest-cli:
+    runs-on: ubuntu-latest
+    outputs:
+      build-seconds: ${{ steps.build.outputs.seconds }}
+      job-seconds: ${{ steps.done.outputs.seconds }}
+    steps:
+      - name: Start the clock
+        run: mkdir -p "$RUNNER_TEMP/clock" && date +%s.%N > "$RUNNER_TEMP/clock/job.start"
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: vitest-cli
+      - id: build
+        name: Build the release CLI
+        run: |
+          packages/soroban-sim-vitest/ci/clock.sh run build -- cargo build --release -p soroban-sim-cli --locked
+          echo "seconds=$(packages/soroban-sim-vitest/ci/clock.sh seconds build)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: soroban-sim-cli
+          path: target/release/soroban-sim
+          retention-days: 1
+      - id: done
+        name: Stop the clock
+        run: |
+          packages/soroban-sim-vitest/ci/clock.sh stop job
+          echo "seconds=$(packages/soroban-sim-vitest/ci/clock.sh seconds job)" >> "$GITHUB_OUTPUT"
+
+  vitest-soroban-sim:
+    needs: vitest-cli
+    runs-on: ubuntu-latest
+    env:
+      CLOCK: packages/soroban-sim-vitest/ci/clock.sh
+      SOROBAN_SIM_BIN: ${{ github.workspace }}/bin/soroban-sim
+    steps:
+      - name: Start the clock
+        run: mkdir -p "$RUNNER_TEMP/clock" && date +%s.%N > "$RUNNER_TEMP/clock/job.start"
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.11.0
+          run_install: false
+      - run: pnpm install --frozen-lockfile
+      - name: Get the CLI (start)
+        run: $CLOCK start binary
+      - uses: actions/download-artifact@v4
+        with:
+          name: soroban-sim-cli
+          path: bin
+      - name: Get the CLI (done)
+        run: chmod +x bin/soroban-sim && $CLOCK stop binary && bin/soroban-sim --version
+      - name: The suites on soroban-sim
+        working-directory: packages/soroban-sim-vitest
+        run: ci/clock.sh run first -- pnpm test
+      - name: The same suites again, setup from the cache
+        working-directory: packages/soroban-sim-vitest
+        run: ci/clock.sh run cached -- pnpm test
+      - name: Stop the clock
+        if: always()
+        run: $CLOCK stop job
+      # Memory is sampled in runs of its own, after the clock has stopped, so
+      # the sampler's load is in none of the reported times.
+      - name: Server memory, both runs again with the sampler (not timed)
+        working-directory: packages/soroban-sim-vitest
+        run: |
+          pnpm cache:clear
+          ci/peak-rss.sh soroban-sim "$RUNNER_TEMP/servers.rss" -- pnpm test
+          ci/peak-rss.sh soroban-sim "$RUNNER_TEMP/servers-cached.rss" -- pnpm test
+      - name: Cost summary
+        if: always()
+        env:
+          BUILD_SECONDS: ${{ needs.vitest-cli.outputs.build-seconds }}
+          CLI_JOB_SECONDS: ${{ needs.vitest-cli.outputs.job-seconds }}
+        run: packages/soroban-sim-vitest/ci/summary.sh soroban-sim
+
+  vitest-quickstart:
+    runs-on: ubuntu-latest
+    env:
+      CLOCK: packages/soroban-sim-vitest/ci/clock.sh
+      # stellar/quickstart:testing (protocol 30, the image the bundled
+      # local-network snapshot was captured from), pinned by digest.
+      QUICKSTART: stellar/quickstart@sha256:d66ab2ea3ac665739e595ab0cebca54619c008485fab547d220bc43b082d13d7
+    steps:
+      - name: Start the clock
+        run: mkdir -p "$RUNNER_TEMP/clock" && date +%s.%N > "$RUNNER_TEMP/clock/job.start"
+      - uses: actions/checkout@v6
+      - name: Pull and start a local network (it warms up while dependencies install)
+        run: |
+          $CLOCK start container
+          docker pull -q "$QUICKSTART"
+          docker run -d -p 127.0.0.1:8000:8000 --name quickstart "$QUICKSTART" --local --enable rpc
+          $CLOCK stop container
+          $CLOCK start since-start
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.11.0
+          run_install: false
+      - run: pnpm install --frozen-lockfile
+      - name: Wait until RPC is healthy and friendbot funds an account
+        run: |
+          $CLOCK run ready -- packages/soroban-sim-vitest/ci/wait-for-funding.sh http://127.0.0.1:8000/rpc http://127.0.0.1:8000/friendbot
+          $CLOCK stop since-start
+      - name: The suites against the local network
+        working-directory: packages/soroban-sim-vitest
+        env:
+          SOROBAN_TEST_RPC_URL: http://127.0.0.1:8000/rpc
+        run: ci/clock.sh run tests -- pnpm test:local
+      - name: Stop the clock
+        if: always()
+        run: $CLOCK stop job
+      - name: Cost summary
+        if: always()
+        run: |
+          id=$(docker inspect -f '{{.Id}}' quickstart)
+          peak="/sys/fs/cgroup/system.slice/docker-$id.scope/memory.peak"
+          if [ -r "$peak" ]; then
+            QUICKSTART_MEMORY_PEAK_MIB=$(awk '{ printf "%.1f", $1 / 1048576 }' "$peak")
+            export QUICKSTART_MEMORY_PEAK_MIB
+          fi
+          packages/soroban-sim-vitest/ci/summary.sh quickstart
+      - name: Local network logs
+        if: failure()
+        run: docker logs quickstart 2>&1 | tail -200
+
   milestone-0:
     runs-on: macos-latest
     steps:
