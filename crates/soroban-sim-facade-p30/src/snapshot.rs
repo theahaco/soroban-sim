@@ -14,14 +14,15 @@
 //!   key in neither `entries` nor `absent` holds: `absent` (the file is
 //!   self-contained) or `base` (the file is a partial view of a live
 //!   network, which a key it never read must still be read from; `base`
-//!   names it).
+//!   names it, and `created_contracts` lists the contracts the session
+//!   created, whose storage that network cannot hold).
 //!
 //! Readers take both versions; writers use version 1 only for base entries.
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::{Deserialize, Serialize};
-use soroban_env_host::xdr::{LedgerEntry, LedgerHeader, LedgerKey, Limits, ReadXdr, WriteXdr};
+use soroban_env_host::xdr::{LedgerEntry, LedgerHeader, LedgerKey, Limits, ReadXdr, ScAddress, WriteXdr};
 use soroban_sim_core::session::{ForkPoint, LedgerSource, PartialSource, Resume, Session, StaticSource, StoredEntry};
 use std::path::Path;
 
@@ -52,6 +53,11 @@ pub struct SnapshotFile {
     /// v2, with `unread: base`: the network such keys are read from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<SnapshotBase>,
+    /// v2, with `unread: base`: the contracts the session created, as
+    /// addresses (`C...`). Storage of theirs in neither `entries` nor
+    /// `absent` is absent and is not read from `base`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub created_contracts: Vec<String>,
     /// v2: every account `entries` or `absent` hold a session-written value
     /// of, with its value on the real network. The safety check reads an
     /// account's real signers here, so a throwaway signer stays one.
@@ -153,6 +159,7 @@ impl SnapshotFile {
             history: None,
             unread: None,
             base: None,
+            created_contracts: vec![],
             network_accounts: vec![],
             entries,
             absent: vec![],
@@ -163,9 +170,12 @@ impl SnapshotFile {
     /// with its writes on top, its clock and counters. `closed` is the last
     /// closed ledger and its close time, `header` that ledger's header.
     /// `base` is the network a lazily read base reads from; without one,
-    /// a partial file records none and cannot be opened.
+    /// a session on such a base is refused: its file could not be opened.
     pub fn export(session: &Session, passphrase: &str, closed: (u32, u64), wall_clock: Option<u64>, header: &LedgerHeader, base: Option<&SnapshotBase>) -> Result<Self> {
         let state = session.ledger().state()?;
+        if !state.complete && base.is_none() {
+            bail!("the session's base is read lazily and this server does not know the RPC it reads from, so a snapshot of it could not be opened: export from `soroban-sim serve --fork`, or from a session on a snapshot");
+        }
         let info = session.ledger_info();
         if closed.0 + 1 != info.sequence_number {
             bail!("the last closed ledger {} is not the one before the next ledger {}", closed.0, info.sequence_number);
@@ -204,6 +214,7 @@ impl SnapshotFile {
             history: Some(SnapshotHistory { applied: resume.applied, submitted: resume.submitted }),
             unread: Some(if state.complete { Unread::Absent } else { Unread::Base }),
             base: if state.complete { None } else { base.cloned() },
+            created_contracts: if state.complete { vec![] } else { state.created_contracts.iter().map(ScAddress::to_string).collect() },
             network_accounts,
             entries,
             absent,
@@ -241,6 +252,7 @@ impl SnapshotFile {
                     || self.history.is_some()
                     || self.unread.is_some()
                     || self.base.is_some()
+                    || !self.created_contracts.is_empty()
                     || !self.network_accounts.is_empty()
                     || !self.absent.is_empty();
                 if v2 {
@@ -349,7 +361,12 @@ impl SnapshotFile {
 
     /// The base of a partial file: what it holds, over `network` for the rest.
     pub fn partial_source(&self, network: Box<dyn LedgerSource>) -> Result<PartialSource> {
-        PartialSource::new(self.fork.ledger, self.present()?, self.absent_keys()?, network)
+        let created = self
+            .created_contracts
+            .iter()
+            .map(|c| c.parse::<ScAddress>().map_err(|_| anyhow!("created_contracts: {c:?} is not a contract address")))
+            .collect::<Result<_>>()?;
+        PartialSource::new(self.fork.ledger, self.present()?, self.absent_keys()?, created, network)
     }
 
     fn base_name(&self) -> String {

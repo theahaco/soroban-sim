@@ -423,6 +423,15 @@ fn a_fee_bump_shows_its_fee_source_paying() {
 }
 
 #[test]
+fn an_export_is_refused_when_the_lazily_read_base_names_no_rpc() {
+    // No embedder told this facade which RPC its base reads from, so a file
+    // of it could not say where the keys it never read are.
+    let mut c = Client::open(PASSPHRASE);
+    let e = c.error("fork_exportSnapshot", json!({}));
+    assert!(e["message"].as_str().unwrap().contains("does not know the RPC it reads from"), "{e}");
+}
+
+#[test]
 fn revert_undoes_transactions_and_keeps_them_listed() {
     let mut c = Client::open(PASSPHRASE);
     let key = rehearse_alice(&mut c);

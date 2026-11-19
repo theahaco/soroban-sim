@@ -7,9 +7,9 @@
 use base64::Engine;
 use serde_json::{json, Value};
 use soroban_env_host::xdr::{
-    Asset, ContractExecutable, ContractIdPreimage, ContractIdPreimageFromAddress, CreateContractArgs,
+    Asset, ContractDataDurability, ContractDataEntry, ContractExecutable, ContractIdPreimage, ContractIdPreimageFromAddress, CreateContractArgs,
     CreateContractArgsV2, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerCloseMeta, LedgerEntry,
-    LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerKey, LedgerKeyContractData, LedgerKeyTtl, Limits, Memo,
+    ExtensionPoint, LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerKey, LedgerKeyContractData, LedgerKeyTtl, Limits, Memo,
     MuxedAccount, Operation, OperationBody, Preconditions, PublicKey, ReadXdr, ScAddress, ScSymbol, ScVal,
     SequenceNumber, SorobanAuthorizationEntry, SorobanTransactionData, Transaction, TransactionEnvelope, TransactionExt,
     TimeBounds, TimePoint, TransactionMeta, TransactionResult, TransactionResultResult, TransactionV1Envelope, Uint256, WriteXdr,
@@ -935,6 +935,63 @@ fn a_partial_export_reads_what_it_never_read_from_its_network() {
         .err()
         .unwrap();
     assert!(format!("{err:#}").contains("names no base"), "{err:#}");
+}
+
+#[test]
+fn a_partial_export_keeps_storage_of_a_contract_it_deployed_off_the_network() {
+    let dir = scratch("partial-created");
+    // The network holds storage under the address the setup deploys at, as
+    // when the same deployer and salt deploy there for real afterwards.
+    let id = contract_id(network_id(TESTNET_PASSPHRASE), ScAddress::Account(alice().account_id()), [7; 32]).unwrap();
+    let network = network_snapshot(&dir);
+    let snap = SnapshotFile::load(&network).unwrap();
+    let mut entries = snap.present().unwrap();
+    entries.push(StoredEntry {
+        entry: LedgerEntry {
+            last_modified_ledger_seq: FORK_LEDGER - 10,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: id.clone(),
+                key: ScVal::U32(1),
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::U32(9),
+            }),
+            ext: LedgerEntryExt::V0,
+        },
+        live_until: Some(FORK_LEDGER + 100_000),
+    });
+    SnapshotFile::new(TESTNET_PASSPHRASE, &snap.fork_point(), &entries).unwrap().save(&network).unwrap();
+    let url = network_rpc(network);
+    let storage = b64(&LedgerKey::ContractData(LedgerKeyContractData { contract: id.clone(), key: ScVal::U32(1), durability: ContractDataDurability::Persistent }));
+
+    // The setup deploys the contract and never reads that key: to it, the
+    // contract is new and holds nothing.
+    let mut a = open(rpc_base(&url), None);
+    substitute_alice(&mut a);
+    assert_eq!(upload_and_deploy(&mut a, TESTNET_PASSPHRASE), id);
+    let first = dir.join("setup.json");
+    let exported = export(&mut a, &first);
+    assert_eq!(exported["unread"], "base");
+    assert_eq!(exported["created_contracts"], json!([id.to_string()]));
+
+    // A server on the file answers the key absent without asking the
+    // network, and the contract runs.
+    let unwritten = |f: &mut Facade| {
+        ok(f, "fork_info", json!({}));
+        let calls = f.report().fetch.rpc_calls;
+        let read = ok(f, "getLedgerEntries", json!({ "keys": [storage] }));
+        assert_eq!(read["entries"], json!([]), "the network's entry is not the session's");
+        assert_eq!(f.report().fetch.rpc_calls, calls, "no network read");
+        let sum = run(f, TESTNET_PASSPHRASE, &alice(), &alice_throwaway(), add(&id, 2, 3));
+        assert_eq!(return_value(&sum), ScVal::I32(5), "{sum}");
+    };
+    unwritten(&mut open(Base::Snapshot(first.clone()), None));
+
+    // An export of a server on the file carries the record on.
+    let second = dir.join("again.json");
+    let again = export(&mut open(Base::Snapshot(first), None), &second);
+    assert_eq!(again["created_contracts"], exported["created_contracts"]);
+    unwritten(&mut open(Base::Snapshot(second), None));
 }
 
 #[test]

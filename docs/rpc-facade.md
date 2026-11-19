@@ -186,7 +186,11 @@ A snapshot file is a ledger to fork: `serve --snapshot FILE` and
   - `network_accounts`: every account the session wrote (overrides,
     transaction sources), with its value on the real network or none when
     the network has no such account;
-  - `unread`: what a key in neither `entries` nor `absent` holds (below).
+  - `unread`: what a key in neither `entries` nor `absent` holds (below);
+  - `created_contracts` (with `"unread": "base"` only): the addresses
+    (`C...`) of the contracts the session deployed. The network cannot hold
+    their storage, so a storage key of theirs that the file does not list is
+    absent and is not read from the network.
 
 A server started from an export answers every ledger read as the one that
 wrote it did (`getLatestLedger`, `getLedgerEntries`, `getNetwork`,
@@ -217,10 +221,16 @@ their events, the steps and report, `fork_snapshot` ids, and the
   network (`fork_info`'s `base` begins `partial snapshot`), checking the
   network's passphrase and protocol first. Keys the file lists, present or
   absent, are never read again, and an export of that server lists them all
-  again. The report's drift section still judges what is read from the
+  again. Storage of a contract the session deployed is never read from the
+  network either: a key of it the file does not list is absent, as it was
+  for the session that wrote the file, even if the network has since come to
+  hold a contract at that address; an export of that server carries
+  `created_contracts` on. The report's drift section still judges what is read from the
   network against `fork_ledger`, the ledger the first session forked at. A
   partial file that names no base is refused rather than read as if its
-  unread keys were absent. To get a self-contained export, start the session
+  unread keys were absent, and `fork_exportSnapshot` does not write one: a
+  session whose embedder never told it which RPC its lazily read base reads
+  from (the browser session) answers the call with an error. To get a self-contained export, start the session
   from a snapshot, such as a captured one.
 
 **Capturing a network.** `soroban-sim snapshot capture --network URL --out

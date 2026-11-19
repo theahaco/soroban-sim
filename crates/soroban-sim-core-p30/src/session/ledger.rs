@@ -18,7 +18,7 @@ use soroban_env_host::xdr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
     ContractDataDurability, LedgerEntry,
     LedgerEntryData, LedgerEntryExt, LedgerKey, LedgerKeyAccount, LedgerKeyContractData,
-    PublicKey, ScErrorCode, ScErrorType, ScVal, SequenceNumber, Signer, SignerKey, SponsorshipDescriptor, String32,
+    PublicKey, ScAddress, ScErrorCode, ScErrorType, ScVal, SequenceNumber, Signer, SignerKey, SponsorshipDescriptor, String32,
     Thresholds, Uint256, VecM,
 };
 use soroban_env_host::HostError;
@@ -66,6 +66,28 @@ pub trait LedgerSource {
     fn known(&self) -> Vec<(LedgerKey, Option<StoredEntry>)> {
         vec![]
     }
+    /// Contracts the exported session created: storage of theirs that
+    /// [`LedgerSource::known`] does not list is absent, answered from memory.
+    fn created_contracts(&self) -> Vec<ScAddress> {
+        vec![]
+    }
+}
+
+/// The contract whose storage `key` is: contract data other than the
+/// instance itself.
+fn storage_contract(key: &LedgerKey) -> Option<&ScAddress> {
+    match key {
+        LedgerKey::ContractData(cd) if cd.key != ScVal::LedgerKeyContractInstance => Some(&cd.contract),
+        _ => None,
+    }
+}
+
+fn instance_key(contract: &ScAddress) -> LedgerKey {
+    LedgerKey::ContractData(LedgerKeyContractData {
+        contract: contract.clone(),
+        key: ScVal::LedgerKeyContractInstance,
+        durability: ContractDataDurability::Persistent,
+    })
 }
 
 /// An in-memory base ledger: fixtures, tests, and offline snapshot files.
@@ -124,15 +146,17 @@ impl LedgerSource for StaticSource {
 
 /// Known keys (present or absent) over a lazily read base: a partial
 /// snapshot of a live fork. Keys it knows are answered from memory; only the
-/// rest go to `base`.
+/// rest go to `base`, except storage of a contract the exported session
+/// created: `base` cannot hold it, so what is not listed is absent.
 pub struct PartialSource {
     ledger: u32,
     known: BTreeMap<LedgerKey, Option<StoredEntry>>,
+    created: BTreeSet<ScAddress>,
     base: Box<dyn LedgerSource>,
 }
 
 impl PartialSource {
-    pub fn new(ledger: u32, present: Vec<StoredEntry>, absent: Vec<LedgerKey>, base: Box<dyn LedgerSource>) -> Result<Self> {
+    pub fn new(ledger: u32, present: Vec<StoredEntry>, absent: Vec<LedgerKey>, created: Vec<ScAddress>, base: Box<dyn LedgerSource>) -> Result<Self> {
         let mut known = BTreeMap::new();
         for key in absent {
             known.insert(key, None);
@@ -140,13 +164,17 @@ impl PartialSource {
         for e in present {
             known.insert(ledger_entry_to_ledger_key(&e.entry)?, Some(e));
         }
-        Ok(Self { ledger, known, base })
+        Ok(Self { ledger, known, created: created.into_iter().collect(), base })
+    }
+
+    fn held(&self, key: &LedgerKey) -> bool {
+        self.known.contains_key(key) || storage_contract(key).is_some_and(|c| self.created.contains(c))
     }
 }
 
 impl LedgerSource for PartialSource {
     fn fetch(&self, keys: &[LedgerKey]) -> Result<FetchedBatch> {
-        let unknown: Vec<LedgerKey> = keys.iter().filter(|k| !self.known.contains_key(*k)).cloned().collect();
+        let unknown: Vec<LedgerKey> = keys.iter().filter(|k| !self.held(k)).cloned().collect();
         let mut entries: Vec<StoredEntry> = keys.iter().filter_map(|k| self.known.get(k).cloned().flatten()).collect();
         let mut served_at_ledger = self.ledger;
         if !unknown.is_empty() {
@@ -163,6 +191,10 @@ impl LedgerSource for PartialSource {
 
     fn known(&self) -> Vec<(LedgerKey, Option<StoredEntry>)> {
         self.known.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
+    fn created_contracts(&self) -> Vec<ScAddress> {
+        self.created.iter().cloned().collect()
     }
 
     fn max_batch(&self) -> usize {
@@ -326,6 +358,9 @@ pub struct LedgerState {
     /// include every entry it has and a key in neither list is absent. When
     /// `false`, such a key is only known by reading the base.
     pub complete: bool,
+    /// Contracts this session or one it continues created: storage of
+    /// theirs in neither list is absent, whatever the base network holds.
+    pub created_contracts: Vec<ScAddress>,
     /// Every account this session or one it continues wrote, with what the
     /// real network holds for it (`None`: no such account there).
     pub network_accounts: Vec<(LedgerKey, Option<StoredEntry>)>,
@@ -451,15 +486,13 @@ impl ForkedLedger {
     /// Storage of a contract whose instance the session created: the base
     /// network cannot hold it, so it is absent without a round trip.
     fn created_in_session(&self, key: &LedgerKey) -> bool {
-        let LedgerKey::ContractData(cd) = key else { return false };
-        if cd.key == ScVal::LedgerKeyContractInstance {
-            return false;
-        }
-        let instance = LedgerKey::ContractData(LedgerKeyContractData {
-            contract: cd.contract.clone(),
-            key: ScVal::LedgerKeyContractInstance,
-            durability: ContractDataDurability::Persistent,
-        });
+        storage_contract(key).is_some_and(|contract| self.created(contract))
+    }
+
+    /// Whether the session created `contract`: its instance is absent from
+    /// the base and written by the session.
+    fn created(&self, contract: &ScAddress) -> bool {
+        let instance = instance_key(contract);
         matches!(self.base_cache.borrow().get(&instance), Some(None))
             && matches!(self.overlay.borrow().get(&instance), Some(Some(_)))
     }
@@ -631,10 +664,16 @@ impl ForkedLedger {
     }
 
     /// The fetches the network answered: every one but those for keys the
-    /// base holds in memory.
+    /// base answers from memory.
     pub fn network_fetches(&self) -> Vec<FetchRecord> {
         let held: BTreeSet<LedgerKey> = self.base.known().into_iter().map(|(key, _)| key).collect();
-        self.fetches.borrow().iter().filter(|f| !held.contains(&f.key)).cloned().collect()
+        let created: BTreeSet<ScAddress> = self.base.created_contracts().into_iter().collect();
+        self.fetches
+            .borrow()
+            .iter()
+            .filter(|f| !held.contains(&f.key) && !storage_contract(&f.key).is_some_and(|c| created.contains(c)))
+            .cloned()
+            .collect()
     }
 
     /// Entries the network had modified after the fork ledger when it served
@@ -670,7 +709,24 @@ impl ForkedLedger {
         known.extend(self.base.known());
         known.extend(self.base_cache.borrow().iter().map(|(k, v)| (k.clone(), v.clone())));
         known.extend(self.overlay.borrow().iter().map(|(k, v)| (k.clone(), v.clone())));
-        let mut state = LedgerState { entries: vec![], absent: vec![], complete, network_accounts: network_accounts.into_iter().collect() };
+        let mut created_contracts: BTreeSet<ScAddress> = self.base.created_contracts().into_iter().collect();
+        let written: Vec<ScAddress> = self
+            .overlay
+            .borrow()
+            .keys()
+            .filter_map(|k| match k {
+                LedgerKey::ContractData(cd) if *k == instance_key(&cd.contract) => Some(cd.contract.clone()),
+                _ => None,
+            })
+            .collect();
+        created_contracts.extend(written.into_iter().filter(|contract| self.created(contract)));
+        let mut state = LedgerState {
+            entries: vec![],
+            absent: vec![],
+            complete,
+            created_contracts: created_contracts.into_iter().collect(),
+            network_accounts: network_accounts.into_iter().collect(),
+        };
         for (key, value) in known {
             match value {
                 Some(e) => state.entries.push(e),
