@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/theahaco/soroban-sim/compare/soroban-sim-core-v0.1.0...soroban-sim-core-v0.2.0) - 2026-11-19
+
+### Added
+
+- *(snapshot)* export a session's state and capture network settings ([#42](https://github.com/theahaco/soroban-sim/pull/42))
+- *(soroban-sign-dialog)* add embeddable sign dialog with a lazy p29/p30 preview engine ([#35](https://github.com/theahaco/soroban-sim/pull/35))
+
+### Fixed
+
+- *(snapshot)* keep deployed contracts' storage off the network ([#44](https://github.com/theahaco/soroban-sim/pull/44))
+
 ## [0.1.0](https://github.com/theahaco/soroban-sim/releases/tag/soroban-sim-core-v0.1.0) - 2026-10-25
 
 ### Added

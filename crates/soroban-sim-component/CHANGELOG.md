@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/theahaco/soroban-sim/compare/soroban-sim-component-v0.1.0...soroban-sim-component-v0.2.0) - 2026-11-19
+
+### Fixed
+
+- *(serve)* keep ledger time at wall-clock pace by default ([#41](https://github.com/theahaco/soroban-sim/pull/41))
+
 ## [0.1.0](https://github.com/theahaco/soroban-sim/releases/tag/soroban-sim-component-v0.1.0) - 2026-10-25
 
 ### Added
