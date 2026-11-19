@@ -88,6 +88,7 @@ h3:first-child { margin-top: var(--ssd-space-2); }
 b { font-weight: var(--ssd-weight-strong); }
 .what ul { list-style: none; margin: var(--ssd-space-2) 0; padding: 0; }
 .what li { font-size: var(--ssd-title-size); font-weight: var(--ssd-weight-strong); line-height: 1.35; overflow-wrap: anywhere; margin: 0 0 var(--ssd-space-1); }
+.what .more-calls { font-weight: inherit; min-height: 0; padding: 0; border: 0; background: none; color: var(--ssd-accent); text-decoration: underline; }
 .budget-line { margin: 0 0 var(--ssd-space-2); color: var(--ssd-muted); font-size: var(--ssd-small-size); }
 .budget-line[data-over="true"] { color: var(--ssd-danger); font-weight: var(--ssd-weight-strong); }
 .status { display: flex; gap: var(--ssd-space-2); align-items: flex-start; border: var(--ssd-border-width) solid var(--ssd-border); border-radius: var(--ssd-radius-sm); padding: var(--ssd-space-2) var(--ssd-space-3); margin: var(--ssd-space-2) 0; background: var(--ssd-surface); }

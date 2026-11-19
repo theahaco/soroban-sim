@@ -584,6 +584,39 @@ export const PERCH_FNS = {
   execute: ['target', 'target_fn', 'target_args'],
 };
 
+/**
+ * The signer's outgoing payment in one call: a SEP-41 `transfer` from the
+ * signer on a contract `tokenOf` knows as a token, else null.
+ */
+export function paymentOf(fn, signer, tokenOf) {
+  if (fn.kind !== 'call' || fn.fn !== 'transfer' || fn.args.length !== 3 || !signer) return null;
+  const token = tokenOf(fn.contract.str);
+  const [from, to, amount] = fn.args;
+  if (!token || from?.str !== signer || !/128|64/.test(amount?.t ?? '')) return null;
+  return { token, amount: amount.v, to };
+}
+
+/** How many sub-call payments one summary line names before it counts the rest. */
+export const SUMMARY_PAYMENTS = 3;
+
+/**
+ * What one summary line says about an authorized call's sub-calls: the
+ * signer's payments, depth first, up to `max`, and how many other sub-calls
+ * (other payments included) it leaves to Details.
+ */
+export function subCallSummary(root, signer, tokenOf, max = SUMMARY_PAYMENTS) {
+  const payments = [];
+  let more = 0;
+  const walk = (inv) => {
+    const p = paymentOf(inv.fn, signer, tokenOf);
+    if (p && payments.length < max) payments.push(p);
+    else more++;
+    inv.subs.forEach(walk);
+  };
+  root.subs.forEach(walk);
+  return { payments, more };
+}
+
 export function formatAmount(v, decimals = 7) {
   const neg = v < 0n;
   let s = (neg ? -v : v).toString().padStart(decimals + 1, '0');
